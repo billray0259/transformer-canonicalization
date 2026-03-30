@@ -8,3 +8,4 @@ __pycache__
 data
 lib/serial_model.py
 params.txt
+*.egg-info/
