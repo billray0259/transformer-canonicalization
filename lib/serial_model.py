@@ -47,7 +47,6 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         vector_list = [torch.cat([bias, torch.zeros(1, 1, device=bias.device, dtype=bias.dtype)], dim=1)]
         return NamedSerialParameters.from_vector_list(names, vector_list)
         
-    
 
     def serialize_layernorm(self, layernorm, name="LayerNorm"):
         weight_row = layernorm.weight.unsqueeze(0)
@@ -62,7 +61,9 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         
         serialized_params = NamedSerialParameters()
         
-        serialized_params += self.serialize_matrix(params.word_embeddings.weight, name=f"{name}.word_embeddings.weight")
+        if params.word_embeddings.weight.data_ptr() != self.cls.predictions.decoder.weight.data_ptr():
+            serialized_params += self.serialize_matrix(params.word_embeddings.weight, name=f"{name}.word_embeddings.weight")
+        
         serialized_params += self.serialize_matrix(params.position_embeddings.weight, name=f"{name}.position_embeddings.weight")
         serialized_params += self.serialize_matrix(params.token_type_embeddings.weight, name=f"{name}.token_type_embeddings.weight")
         
@@ -125,24 +126,25 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         return serialized_params
     
     def serialize_mlm_head(self, name="predictions"):
+        params = self.cls.predictions
         serialized_params = NamedSerialParameters()
         
         # Transform dense layer and bias
         serialized_params += self.serialize_matrix(
-            matrix=self.cls.predictions.transform.dense.weight,
+            matrix=params.transform.dense.weight,
             name=f"{name}.transform.dense.weight",
-            bias=self.cls.predictions.transform.dense.bias
+            bias=params.transform.dense.bias
         )
         
         # LayerNorm if it exists
-        if self.cls.predictions.transform.LayerNorm is not None:
-            serialized_params += self.serialize_layernorm(self.cls.predictions.transform.LayerNorm, name=f"{name}.transform.LayerNorm")
+        if params.transform.LayerNorm is not None:
+            serialized_params += self.serialize_layernorm(params.transform.LayerNorm, name=f"{name}.transform.LayerNorm")
         
-        # Output decoder layer and if bias_method == "separate" return the bias as a separate tensor
+        # Output decoder layer
         serialized_params += self.serialize_matrix(
-            matrix=self.cls.predictions.decoder.weight,
+            matrix=params.decoder.weight,
             name=f"{name}.decoder.weight",
-            bias=self.cls.predictions.bias
+            bias=params.bias
         )
         
         return serialized_params

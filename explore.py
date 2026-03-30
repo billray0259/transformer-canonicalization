@@ -35,12 +35,12 @@ serial_model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
 # %%
 
 
-serialized_params, cls_bias = serial_model.serialize(bias_method="separate")
+serialized_params = serial_model.serialize()
 print(f"Serialized parameters: {[serialized_params.names[i] for i in range(0, len(serialized_params.names), 10000)]}")
 print(f"Serialized parameters shape: {serialized_params.vectors.shape}")
-print(f"CLS bias shape: {cls_bias.shape}")
 # %% 
 
 print("Total original parameters:\t", sum(p.numel() for p in mlm_model.parameters()))
-print("Total serialized parameters:\t", serialized_params.vectors.numel() + (cls_bias.numel() if cls_bias is not None else 0))
+print("Total serialized parameters:\t", serialized_params.vectors.numel())
+print("Difference:\t\t\t", serialized_params.vectors.numel() - sum(p.numel() for p in mlm_model.parameters()))
 # %%

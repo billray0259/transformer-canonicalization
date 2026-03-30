@@ -43,6 +43,20 @@ def patch_working_serialize_bias(model):
     return model
 
 
+def has_tied_input_output_embeddings(model):
+    return (
+        model.base_model.embeddings.word_embeddings.weight.data_ptr()
+        == model.cls.predictions.decoder.weight.data_ptr()
+    )
+
+
+def untie_input_output_embeddings(model):
+    model.cls.predictions.decoder.weight = torch.nn.Parameter(
+        model.cls.predictions.decoder.weight.detach().clone()
+    )
+    return model
+
+
 def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_config):
     dummy_model = BertForMaskedLM(tiny_config)
 
@@ -121,31 +135,49 @@ def test_serialize_layernorm_uses_weight_and_bias_rows(tiny_serial_model):
     torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(2))
 
 
-def test_serialize_embeddings_contains_embedding_tables_and_layernorm(tiny_serial_model, tiny_config):
-    serialized = tiny_serial_model.serialize_embeddings()
+@pytest.mark.parametrize("tied_embeddings", [True, False])
+def test_serialize_embeddings_contains_expected_tables_and_layernorm(tiny_serial_model, tiny_config, tied_embeddings):
+    if not tied_embeddings:
+        untie_input_output_embeddings(tiny_serial_model)
 
-    assert len(serialized.names) == tiny_config.vocab_size + tiny_config.max_position_embeddings + tiny_config.type_vocab_size + 2
-    assert serialized.vectors.shape == (23, tiny_config.hidden_size + 1)
-    assert serialized.names[:3] == [
-        "embeddings.word_embeddings.weight.0",
-        "embeddings.word_embeddings.weight.1",
-        "embeddings.word_embeddings.weight.2",
-    ]
+    serialized = tiny_serial_model.serialize_embeddings()
+    skips_word_embeddings = has_tied_input_output_embeddings(tiny_serial_model)
+    expected_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size + 2
+    if not skips_word_embeddings:
+        expected_rows += tiny_config.vocab_size
+
+    assert len(serialized.names) == expected_rows
+    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
+    if skips_word_embeddings:
+        assert serialized.names[:3] == [
+            "embeddings.position_embeddings.weight.0",
+            "embeddings.position_embeddings.weight.1",
+            "embeddings.position_embeddings.weight.2",
+        ]
+    else:
+        assert serialized.names[:3] == [
+            "embeddings.word_embeddings.weight.0",
+            "embeddings.word_embeddings.weight.1",
+            "embeddings.word_embeddings.weight.2",
+        ]
     assert serialized.names[-2:] == ["embeddings.LayerNorm.weight", "embeddings.LayerNorm.bias"]
-    torch.testing.assert_close(
-        serialized.vectors[0, :4],
-        tiny_serial_model.base_model.embeddings.word_embeddings.weight[0],
-    )
-    torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(23))
+    first_embedding_table = tiny_serial_model.base_model.embeddings.position_embeddings
+    if not skips_word_embeddings:
+        first_embedding_table = tiny_serial_model.base_model.embeddings.word_embeddings
+    torch.testing.assert_close(serialized.vectors[0, :4], first_embedding_table.weight[0])
+    torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(expected_rows))
 
 
 def test_serialize_embeddings_skips_missing_layernorm(tiny_serial_model, tiny_config):
     tiny_serial_model.base_model.embeddings.LayerNorm = None
 
     serialized = tiny_serial_model.serialize_embeddings()
+    expected_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size
+    if not has_tied_input_output_embeddings(tiny_serial_model):
+        expected_rows += tiny_config.vocab_size
 
-    assert len(serialized.names) == tiny_config.vocab_size + tiny_config.max_position_embeddings + tiny_config.type_vocab_size
-    assert serialized.vectors.shape == (21, tiny_config.hidden_size + 1)
+    assert len(serialized.names) == expected_rows
+    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
     assert all("LayerNorm" not in name for name in serialized.names)
 
 
@@ -244,10 +276,45 @@ def test_serialize_mlm_head_skips_missing_layernorm(tiny_serial_model, tiny_conf
     torch.testing.assert_close(serialized.vectors[-1, -1], tiny_serial_model.cls.predictions.bias[-1])
 
 
-def test_serialize_aggregates_embeddings_encoder_and_mlm_head(tiny_serial_model, tiny_config):
+@pytest.mark.parametrize("tied_embeddings", [True, False])
+def test_serialize_aggregates_embeddings_encoder_and_mlm_head(tiny_serial_model, tiny_config, tied_embeddings):
+    if not tied_embeddings:
+        untie_input_output_embeddings(tiny_serial_model)
+
     patch_working_serialize_bias(tiny_serial_model)
     serialized = tiny_serial_model.serialize()
 
-    assert len(serialized.names) == 116
-    assert serialized.vectors.shape == (116, tiny_config.hidden_size + 1)
+    embedding_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size + 2
+    if not has_tied_input_output_embeddings(tiny_serial_model):
+        embedding_rows += tiny_config.vocab_size
+    expected_rows = embedding_rows + tiny_config.num_hidden_layers * 38 + 17
+
+    assert len(serialized.names) == expected_rows
+    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
+
+
+@pytest.mark.parametrize("tied_embeddings", [True, False])
+def test_serialize_parameter_count_matches_expected_padding_overhead(tiny_serial_model, tiny_config, tied_embeddings):
+    if not tied_embeddings:
+        untie_input_output_embeddings(tiny_serial_model)
+
+    patch_working_serialize_bias(tiny_serial_model)
+
+    original_parameter_count = sum(parameter.numel() for parameter in tiny_serial_model.parameters())
+    serialized = tiny_serial_model.serialize()
+    serialized_parameter_count = serialized.vectors.numel()
+
+    expected_extra_parameters = (
+        + tiny_config.max_position_embeddings
+        + tiny_config.type_vocab_size
+        + 2
+        + tiny_config.num_hidden_layers * (tiny_config.hidden_size + tiny_config.intermediate_size + 6)
+        + 2
+    )
+
+    if not has_tied_input_output_embeddings(tiny_serial_model):
+        expected_extra_parameters += tiny_config.vocab_size
+
+    assert serialized_parameter_count - original_parameter_count == expected_extra_parameters
+    assert serialized_parameter_count == original_parameter_count + expected_extra_parameters
 
