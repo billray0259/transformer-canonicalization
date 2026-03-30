@@ -5,3 +5,5 @@
 /coverage.json
 /pytest.ini
 __pycache__
+data
+lib/serial_model.py

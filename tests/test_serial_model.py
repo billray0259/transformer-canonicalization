@@ -32,7 +32,7 @@ def patch_working_serialize_bias(model):
         assert bias.shape[0] == self.config.hidden_size, "Bias must have the same size as the model's hidden size."
         names = [f"{name}.bias" if name is not None else "bias"]
         padded_bias = torch.cat(
-            [bias.unsqueeze(0), torch.zeros(1, 1, device=bias.device, dtype=bias.dtype)],
+            [bias.unsqueeze(0), torch.full((1, 1), float("nan"), device=bias.device, dtype=bias.dtype)],
             dim=1,
         )
         from lib.serial_params import NamedSerialParameters
@@ -77,7 +77,7 @@ def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_
         assert method.__self__ is dummy_model
 
 
-def test_serialize_matrix_without_bias_pads_zero_column(tiny_serial_model):
+def test_serialize_matrix_without_bias_pads_nan_column(tiny_serial_model):
     matrix = torch.arange(12, dtype=torch.float32).view(3, 4)
 
     serialized = tiny_serial_model.serialize_matrix(matrix, name="proj")
@@ -85,7 +85,7 @@ def test_serialize_matrix_without_bias_pads_zero_column(tiny_serial_model):
     assert serialized.names == ["proj.0", "proj.1", "proj.2"]
     assert serialized.vectors.shape == (3, 5)
     torch.testing.assert_close(serialized.vectors[:, :4], matrix)
-    torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(3))
+    assert torch.isnan(serialized.vectors[:, 4]).all()
 
 
 def test_serialize_matrix_with_bias_appends_bias_as_last_column(tiny_serial_model):
@@ -115,7 +115,7 @@ def test_serialize_bias_creates_single_padded_row(tiny_serial_model):
     assert serialized.names == ["proj.bias"]
     assert serialized.vectors.shape == (1, 5)
     torch.testing.assert_close(serialized.vectors[0, :4], bias)
-    torch.testing.assert_close(serialized.vectors[0, 4], torch.tensor(0.0))
+    assert torch.isnan(serialized.vectors[0, 4])
 
 
 def test_serialize_bias_rejects_hidden_size_mismatch(tiny_serial_model):
@@ -132,7 +132,7 @@ def test_serialize_layernorm_uses_weight_and_bias_rows(tiny_serial_model):
     assert serialized.vectors.shape == (2, 5)
     torch.testing.assert_close(serialized.vectors[0, :4], layernorm.weight)
     torch.testing.assert_close(serialized.vectors[1, :4], layernorm.bias)
-    torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(2))
+    assert torch.isnan(serialized.vectors[:, 4]).all()
 
 
 @pytest.mark.parametrize("tied_embeddings", [True, False])
@@ -165,7 +165,7 @@ def test_serialize_embeddings_contains_expected_tables_and_layernorm(tiny_serial
     if not skips_word_embeddings:
         first_embedding_table = tiny_serial_model.base_model.embeddings.word_embeddings
     torch.testing.assert_close(serialized.vectors[0, :4], first_embedding_table.weight[0])
-    torch.testing.assert_close(serialized.vectors[:, 4], torch.zeros(expected_rows))
+    assert torch.isnan(serialized.vectors[:, 4]).all()
 
 
 def test_serialize_embeddings_skips_missing_layernorm(tiny_serial_model, tiny_config):
@@ -189,16 +189,18 @@ def test_serialize_attention_serializes_read_biases_inline_and_write_bias_separa
 
     assert len(serialized.names) == 19
     assert serialized.vectors.shape == (19, tiny_config.hidden_size + 1)
-    assert serialized.names[0] == "attn.self.query.0"
-    assert serialized.names[12] == "attn.output.dense.weight.0"
+    assert serialized.names[0] == "attn.self.query.head.0.0"
+    assert serialized.names[1] == "attn.self.query.head.0.1"
+    assert serialized.names[2] == "attn.self.query.head.1.0"
+    assert serialized.names[12] == "attn.output.dense.weight.head.0.0"
     assert serialized.names[16] == "attn.output.dense.bias"
     assert serialized.names[-2:] == ["attn.output.LayerNorm.weight", "attn.output.LayerNorm.bias"]
     torch.testing.assert_close(serialized.vectors[0, :4], attention.self.query.weight[0])
     torch.testing.assert_close(serialized.vectors[:4, 4], attention.self.query.bias)
     torch.testing.assert_close(serialized.vectors[12, :4], attention.output.dense.weight.T[0])
-    torch.testing.assert_close(serialized.vectors[12:16, 4], torch.zeros(4))
+    assert torch.isnan(serialized.vectors[12:16, 4]).all()
     torch.testing.assert_close(serialized.vectors[16, :4], attention.output.dense.bias)
-    torch.testing.assert_close(serialized.vectors[16, 4], torch.tensor(0.0))
+    assert torch.isnan(serialized.vectors[16, 4])
 
 
 def test_serialize_attention_skips_missing_output_layernorm(tiny_serial_model, tiny_config):
@@ -317,4 +319,18 @@ def test_serialize_parameter_count_matches_expected_padding_overhead(tiny_serial
 
     assert serialized_parameter_count - original_parameter_count == expected_extra_parameters
     assert serialized_parameter_count == original_parameter_count + expected_extra_parameters
+
+
+@pytest.mark.parametrize("tied_embeddings", [True, False])
+def test_serialize_preserves_non_nan_parameter_count(tiny_serial_model, tied_embeddings):
+    if not tied_embeddings:
+        untie_input_output_embeddings(tiny_serial_model)
+
+    patch_working_serialize_bias(tiny_serial_model)
+
+    original_parameter_count = sum(parameter.numel() for parameter in tiny_serial_model.parameters())
+    serialized = tiny_serial_model.serialize()
+    non_nan_serialized_parameter_count = torch.count_nonzero(~torch.isnan(serialized.vectors)).item()
+
+    assert non_nan_serialized_parameter_count == original_parameter_count
 

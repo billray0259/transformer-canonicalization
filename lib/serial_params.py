@@ -33,3 +33,14 @@ class NamedSerialParameters:
         self._vectors = torch.cat(self._vector_list, dim=0)
         self._vector_list = [self._vectors]
         return self._vectors
+    
+    def save(self, path):
+        torch.save({
+            'names': self.names,
+            'vectors': self.vectors
+        }, path)
+        
+    @classmethod
+    def load(cls, path):
+        data = torch.load(path)
+        return cls.from_vector_list(data['names'], [data['vectors']])

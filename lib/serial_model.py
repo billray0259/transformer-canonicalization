@@ -25,14 +25,17 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
 
         return model
     
-    def serialize_matrix(self, matrix, name="matrix", bias=None):        
+    def serialize_matrix(self, matrix, name="matrix", bias=None, names=None):        
         assert matrix.shape[1] == self.config.hidden_size, "Matrix must have the same number of columns as the model's hidden size."
-        
-        names = [f"{name}.{i}" for i in range(matrix.shape[0])]
+
+        if names is None:
+            names = [f"{name}.{i}" for i in range(matrix.shape[0])]
+        else:
+            assert len(names) == matrix.shape[0], "Names must match the number of matrix rows."
         vector_list = None
         if bias is None:
-            # Pad with zeros to maintain consistent shape for concatenation, but don't include a bias name since there is no bias
-            vector_list = [torch.cat([matrix, torch.zeros(matrix.shape[0], 1, device=matrix.device, dtype=matrix.dtype)], dim=1)]
+            # Pad with NaN sentinels to maintain consistent shape for concatenation, but don't include a bias name since there is no bias
+            vector_list = [torch.cat([matrix, torch.full((matrix.shape[0], 1), float('nan'), device=matrix.device, dtype=matrix.dtype)], dim=1)]
         else:
             # Concatenate the bias to the matrix
             vector_list = [torch.cat([matrix, bias.unsqueeze(1)], dim=1)]            
@@ -44,15 +47,15 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         assert bias.shape[0] == self.config.hidden_size, "Bias must have the same size as the model's hidden size."
         names = [f"{name}.bias" if name is not None else "bias"]
         bias = bias.unsqueeze(0)
-        vector_list = [torch.cat([bias, torch.zeros(1, 1, device=bias.device, dtype=bias.dtype)], dim=1)]
+        vector_list = [torch.cat([bias, torch.full((1, 1), float('nan'), device=bias.device, dtype=bias.dtype)], dim=1)]
         return NamedSerialParameters.from_vector_list(names, vector_list)
         
 
     def serialize_layernorm(self, layernorm, name="LayerNorm"):
         weight_row = layernorm.weight.unsqueeze(0)
         bias_row = layernorm.bias.unsqueeze(0)
-        weight_row = torch.cat([weight_row, torch.zeros(1, 1, device=weight_row.device, dtype=weight_row.dtype)], dim=1)
-        bias_row = torch.cat([bias_row, torch.zeros(1, 1, device=bias_row.device, dtype=bias_row.dtype)], dim=1)
+        weight_row = torch.cat([weight_row, torch.full((1, 1), float('nan'), device=weight_row.device, dtype=weight_row.dtype)], dim=1)
+        bias_row = torch.cat([bias_row, torch.full((1, 1), float('nan'), device=bias_row.device, dtype=bias_row.dtype)], dim=1)
         return NamedSerialParameters.from_vector_list([f"{name}.weight", f"{name}.bias"], [weight_row, bias_row])
                 
         
@@ -74,18 +77,27 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
     
     def serialize_attention(self, attention, name="attention"):
         serialized_params = NamedSerialParameters()
+        num_heads = attention.self.num_attention_heads
+        head_dim = attention.self.attention_head_size
+
+        def head_names(prefix):
+            return [
+                f"{prefix}.head.{head_idx}.{row_idx}"
+                for head_idx in range(num_heads)
+                for row_idx in range(head_dim)
+            ]
         
         # Query, Key, Value matrices and biases
         for matrix_name in ["query", "key", "value"]:
             qkv = getattr(attention.self, matrix_name)
             serialized_params += self.serialize_matrix(
                 matrix=qkv.weight,
-                name=f"{name}.self.{matrix_name}",
-                bias=qkv.bias
+                bias=qkv.bias,
+                names=head_names(f"{name}.self.{matrix_name}"),
             )
         
         # Output dense layer and bias
-        serialized_params += self.serialize_matrix(matrix=attention.output.dense.weight.T, name=f"{name}.output.dense.weight")
+        serialized_params += self.serialize_matrix(matrix=attention.output.dense.weight.T, names=head_names(f"{name}.output.dense.weight"))
         serialized_params += self.serialize_bias(bias=attention.output.dense.bias, name=f"{name}.output.dense")
 
         # Output LayerNorm if it exists
