@@ -4,3 +4,4 @@
 /.venv
 /coverage.json
 /pytest.ini
+__pycache__
