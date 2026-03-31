@@ -1,13 +1,14 @@
+import math
 from types import MethodType
 
 import pytest
 import torch
 from torch.func import functional_call
-from transformers import AutoModelForMaskedLM, BertForMaskedLM
+from transformers import AutoModelForMaskedLM, AutoTokenizer, BertForMaskedLM
 
 from lib.serial_model import SerialAutoModelForMaskedLM
 from lib.serial_params import NamedSerialParameters
-
+from lib.utils import masked_token_pseudo_perplexity
 
 SERIAL_METHOD_NAMES = (
     "serialize_matrix",
@@ -74,6 +75,13 @@ def load_pretrained_serial_model_or_skip(model_name="google/multiberts-seed_0"):
 
     model.eval()
     return model
+
+
+def load_tokenizer_or_skip(model_name="google/multiberts-seed_0"):
+    try:
+        return AutoTokenizer.from_pretrained(model_name)
+    except Exception as exc:
+        pytest.skip(f"Could not load tokenizer for {model_name}: {exc}")
 
 
 def run_and_capture_self_attention_context(model, layer_index, run_forward):
@@ -553,4 +561,27 @@ def test_load_serialized_zeroed_attention_head_only_affects_that_head(monkeypatc
         zeroed_context[:, :, 1 - head_index],
         baseline_context[:, :, 1 - head_index],
     )
+
+
+def test_load_serialized_ppl():
+    model_name = "google/multiberts-seed_0"
+    tokenizer = load_tokenizer_or_skip(model_name)
+    source_model = load_pretrained_serial_model_or_skip(model_name)
+    patch_working_serialize_bias(source_model)
+    serialized = source_model.serialize()
+
+    loaded_model, overrides = SerialAutoModelForMaskedLM.load_serialized(serialized, model_name)
+    loaded_model.eval()
+
+    perplexity = masked_token_pseudo_perplexity(
+        loaded_model,
+        tokenizer,
+        [
+            "The capital of France is Paris.",
+            "Water freezes at zero degrees Celsius.",
+        ],
+        overrides=overrides,
+    )
+
+    assert perplexity < 10
 

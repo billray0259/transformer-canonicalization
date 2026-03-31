@@ -9,3 +9,4 @@ data
 lib/serial_model.py
 params.txt
 *.egg-info/
+wandb/
