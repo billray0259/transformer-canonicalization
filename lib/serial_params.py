@@ -94,6 +94,59 @@ class MultiStreamSerialParameters(dict):
             model_vectors[matching_indices] = matrix.T @ model_vectors[matching_indices]
 
         return self
+
+    def apply_attention_head_matrix(self, matrix, layer_idx):
+        head_indices = sorted(
+            int(stream_name.split(".")[1][1:])
+            for stream_name in self
+            if stream_name.startswith(f"L{layer_idx}.H") and stream_name.endswith(".qk")
+        )
+        if not head_indices:
+            raise ValueError(f"No attention heads found for layer {layer_idx}.")
+        if matrix.shape != (len(head_indices), len(head_indices)):
+            raise ValueError(f"Expected a ({len(head_indices)}, {len(head_indices)}) matrix for layer {layer_idx} heads.")
+
+        model_vectors = self["model"].vectors
+        matrix = matrix.to(device=model_vectors.device, dtype=model_vectors.dtype)
+        hidden_size = model_vectors.shape[1]
+        heads = []
+        specs = []
+        for head_idx in head_indices:
+            qk_name = f"L{layer_idx}.H{head_idx}.qk"
+            ov_name = f"L{layer_idx}.H{head_idx}.ov"
+            q_prefixes = self.get_equivalence_class(qk_name)
+            ov_prefixes = self.get_equivalence_class(ov_name)
+            prefixes = [
+                next(prefix for prefix in q_prefixes if ".query." in prefix),
+                next(prefix for prefix in q_prefixes if ".key." in prefix),
+                next(prefix for prefix in ov_prefixes if ".value." in prefix),
+                next(prefix for prefix in ov_prefixes if ".output." in prefix),
+            ]
+            index_blocks = [
+                [idx for idx, name in enumerate(self["model"].names) if self._matches_equivalence_prefix(name, prefix)]
+                for prefix in prefixes
+            ]
+            heads.append(
+                torch.cat(
+                    [*(model_vectors[indices].reshape(-1) for indices in index_blocks), self[qk_name].vectors.reshape(-1), self[ov_name].vectors.reshape(-1)]
+                )
+            )
+            specs.append((index_blocks, qk_name, ov_name, self[qk_name].vectors.shape, self[ov_name].vectors.shape))
+
+        permuted = matrix @ torch.stack(heads)
+        for row, (index_blocks, qk_name, ov_name, qk_shape, ov_shape) in zip(permuted, specs):
+            offset = 0
+            for indices in index_blocks:
+                block_size = len(indices) * hidden_size
+                model_vectors[indices] = row[offset:offset + block_size].reshape(len(indices), hidden_size)
+                offset += block_size
+            qk_size = qk_shape.numel()
+            self[qk_name].vectors[:] = row[offset:offset + qk_size].reshape(qk_shape)
+            offset += qk_size
+            ov_size = ov_shape.numel()
+            self[ov_name].vectors[:] = row[offset:offset + ov_size].reshape(ov_shape)
+
+        return self
     
     def __str__(self):
         return str({f"{stream_name} {self.equivalence_classes.get(stream_name, [])}": str(named_params) for stream_name, named_params in self.items()})

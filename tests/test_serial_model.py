@@ -370,15 +370,15 @@ def test_multibert_permutation_equivalence_classes_preserve_outputs():
     permuted = clone_multistream(serialized)
 
     torch.manual_seed(0)
-    permutable_stream_names = [
-        stream_name
-        for stream_name in permuted.stream_names
-        if permuted.get_equivalence_class(stream_name)
-    ]
-    for stream_name in permutable_stream_names:
-        width = permuted[stream_name].vectors.shape[1]
-        permutation = torch.eye(width)[torch.randperm(width)]
-        permuted.apply_square_matrix(permutation, stream_name)
+    for layer_idx in range(source_model.config.num_hidden_layers):
+        head_permutation = torch.eye(source_model.config.num_attention_heads)[
+            torch.randperm(source_model.config.num_attention_heads)
+        ]
+        permuted.apply_attention_head_matrix(head_permutation, layer_idx)
+        mlp_permutation = torch.eye(permuted[f"L{layer_idx}.mlp"].vectors.shape[1])[
+            torch.randperm(permuted[f"L{layer_idx}.mlp"].vectors.shape[1])
+        ]
+        permuted.apply_square_matrix(mlp_permutation, f"L{layer_idx}.mlp")
 
     permuted_model, overrides = SerialAutoModelForMaskedLM.load_serialized(permuted, model_name)
     input_ids = torch.randint(0, source_model.config.vocab_size, (2, 8))
