@@ -1,220 +1,162 @@
 import pytest
 import torch
 
-from lib.serial_params import NamedSerialParameters
-from lib.serial_reader import SerializedParameterReader
+from lib.serial_params import MultiStreamSerialParameters, NamedSerialParameters
+from lib.serial_reader import (
+    MultiStreamSerializedParameterReader,
+    SerializedParameterOverrides,
+    SerializedParameterReader,
+)
 
 
-def make_reader(names, rows):
-    return SerializedParameterReader(NamedSerialParameters.from_vector_list(names, [rows]))
+def make_named(names, rows):
+    return NamedSerialParameters.from_vector_list(names, [torch.tensor(rows, dtype=torch.float32)])
 
 
-def test_split_matrix_and_bias_returns_matrix_and_inline_bias():
-    rows = torch.tensor(
-        [
-            [1.0, 2.0, 10.0],
-            [3.0, 4.0, 20.0],
-        ]
+def test_named_reader_reads_matrix_bias_and_layernorm_in_order():
+    reader = SerializedParameterReader(
+        make_named(
+            ["proj.0", "proj.1", "proj.bias", "norm.weight", "norm.bias"],
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
+        )
     )
 
-    matrix, bias = SerializedParameterReader.split_matrix_and_bias(rows)
+    torch.testing.assert_close(reader.read_matrix("proj", 2), torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    torch.testing.assert_close(reader.read_bias("proj"), torch.tensor([5.0, 6.0]))
+    torch.testing.assert_close(reader.read_optional_layernorm("norm"), torch.tensor([[7.0, 8.0], [9.0, 10.0]]))
+    reader.assert_done()
 
-    torch.testing.assert_close(matrix, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-    torch.testing.assert_close(bias, torch.tensor([10.0, 20.0]))
 
-
-def test_split_matrix_and_bias_returns_none_when_bias_column_is_nan():
-    rows = torch.tensor(
-        [
-            [1.0, 2.0, float("nan")],
-            [3.0, 4.0, float("nan")],
-        ]
+def test_multistream_reader_selects_requested_stream():
+    params = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": make_named(["block.0"], [[1.0, 2.0]]),
+            "L0.H0.qk": make_named(["attn.bias"], [[3.0, 4.0]]),
+        }
     )
 
-    matrix, bias = SerializedParameterReader.split_matrix_and_bias(rows)
+    model_reader = SerializedParameterReader(params, "model")
+    qk_reader = SerializedParameterReader(params, "L0.H0.qk")
+    missing_reader = SerializedParameterReader(params, "decoder")
 
-    torch.testing.assert_close(matrix, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-    assert bias is None
+    torch.testing.assert_close(model_reader.read_matrix("block", 1), torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(qk_reader.read_bias("attn"), torch.tensor([3.0, 4.0]))
+    assert missing_reader.peek() is None
+    missing_reader.assert_done()
 
 
-def test_split_matrix_and_bias_rejects_mixed_bias_padding():
-    rows = torch.tensor(
-        [
-            [1.0, 2.0, float("nan")],
-            [3.0, 4.0, 5.0],
-        ]
+def test_multistream_wrapper_caches_readers_and_checks_all_streams():
+    params = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": make_named(["block.0"], [[1.0, 2.0]]),
+            "L0.H0.qk": make_named(["attn.bias"], [[3.0, 4.0]]),
+        }
     )
 
-    with pytest.raises(AssertionError, match="mix padded and non-padded"):
-        SerializedParameterReader.split_matrix_and_bias(rows)
+    readers = MultiStreamSerializedParameterReader(params)
+
+    assert readers["model"] is readers["model"]
+    assert readers["L0.H0.qk"] is readers["L0.H0.qk"]
+    torch.testing.assert_close(readers["model"].read_matrix("block", 1), torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(readers["L0.H0.qk"].read_bias("attn"), torch.tensor([3.0, 4.0]))
+    readers.assert_done()
 
 
-def test_peek_startswith_and_take_advance_reader_cursor():
-    reader = make_reader(
-        ["block.0", "block.1", "tail.bias"],
-        torch.tensor(
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, float("nan")],
-            ]
+def test_reader_can_reassemble_head_partitioned_biases():
+    params = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "L0.H0.qk": make_named(["attn.head.0.bias"], [[1.0, 2.0]]),
+            "L0.H1.qk": make_named(["attn.head.1.bias"], [[3.0, 4.0]]),
+        }
+    )
+
+    overrides = SerializedParameterOverrides(params)
+
+    torch.testing.assert_close(
+        overrides.head_bias(
+            "attn.bias",
+            stream_names=["L0.H0.qk", "L0.H1.qk"],
         ),
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+    overrides.assert_done()
+
+
+def test_reader_startswith_and_wrapper_supports_flat_inputs_and_missing_streams():
+    readers = MultiStreamSerializedParameterReader(make_named(["block.0"], [[1.0, 2.0]]))
+
+    assert readers["model"].startswith("block")
+    assert not readers["model"].startswith("other")
+    assert readers["decoder"].peek() is None
+    readers["decoder"].assert_done()
+
+
+def test_overrides_context_reads_and_stores_values():
+    params = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": make_named(["proj.weight.0", "proj.weight.1", "norm.weight", "norm.bias"], [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]),
+            "proj.weight": make_named(["proj.bias"], [[9.0, 10.0]]),
+        }
     )
 
-    assert reader.peek() == "block.0"
-    assert reader.startswith("block")
+    overrides = SerializedParameterOverrides(params)
 
-    rows = reader.take(["block.0", "block.1"])
+    overrides.matrix("proj.weight", 2)
+    overrides.bias("proj.bias", stream="proj.weight")
+    overrides.optional_layernorm("norm")
 
-    torch.testing.assert_close(rows, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-    assert reader.peek() == "tail.bias"
-    assert not reader.startswith("block")
+    torch.testing.assert_close(overrides["proj.weight"], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    torch.testing.assert_close(overrides["proj.bias"], torch.tensor([9.0, 10.0]))
+    torch.testing.assert_close(overrides["norm.weight"], torch.tensor([5.0, 6.0]))
+    torch.testing.assert_close(overrides["norm.bias"], torch.tensor([7.0, 8.0]))
+    overrides.assert_done()
+
+
+def test_overrides_has_prefix_can_check_specific_streams():
+    params = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": make_named(["residual.0"], [[1.0, 2.0]]),
+            "decoder": make_named(["decoder.weight.0"], [[3.0, 4.0]]),
+        }
+    )
+
+    overrides = SerializedParameterOverrides(params)
+
+    assert overrides.has_prefix("decoder.weight")
+    assert overrides.has_prefix("decoder.weight", stream="decoder")
+    assert not overrides.has_prefix("decoder.weight", stream="model")
+
+
+def test_read_head_matrix_uses_head_indexed_order():
+    reader = SerializedParameterReader(
+        make_named(
+            [
+                "attn.head.0.0",
+                "attn.head.0.1",
+                "attn.head.1.0",
+                "attn.head.1.1",
+            ],
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+        )
+    )
+
+    torch.testing.assert_close(
+        reader.read_head_matrix("attn", num_heads=2, head_dim=2),
+        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]),
+    )
+    reader.assert_done()
 
 
 def test_take_rejects_unexpected_names():
-    reader = make_reader(["block.0"], torch.tensor([[1.0, 2.0]]))
+    reader = SerializedParameterReader(make_named(["block.0"], [[1.0, 2.0]]))
 
     with pytest.raises(AssertionError, match="Expected rows"):
         reader.take(["other.0"])
 
 
-def test_take_optional_layernorm_returns_rows_and_none_when_absent():
-    reader = make_reader(
-        ["norm.weight", "norm.bias", "next.0"],
-        torch.tensor(
-            [
-                [1.0, 2.0, float("nan")],
-                [3.0, 4.0, float("nan")],
-                [5.0, 6.0, float("nan")],
-            ]
-        ),
-    )
-
-    rows = reader.take_optional_layernorm("norm")
-    missing = reader.take_optional_layernorm("missing")
-
-    torch.testing.assert_close(
-        rows,
-        torch.tensor(
-            [
-                [1.0, 2.0, float("nan")],
-                [3.0, 4.0, float("nan")],
-            ]
-        ),
-        equal_nan=True,
-    )
-    assert missing is None
-    assert reader.peek() == "next.0"
-
-
-def test_read_matrix_reads_prefixed_rows_and_splits_inline_bias():
-    reader = make_reader(
-        ["proj.0", "proj.1"],
-        torch.tensor(
-            [
-                [1.0, 2.0, 10.0],
-                [3.0, 4.0, 20.0],
-            ]
-        ),
-    )
-
-    matrix, bias = reader.read_matrix("proj", 2)
-
-    torch.testing.assert_close(matrix, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-    torch.testing.assert_close(bias, torch.tensor([10.0, 20.0]))
-
-
-def test_read_head_matrix_reads_head_indexed_rows_in_expected_order():
-    reader = make_reader(
-        [
-            "attn.head.0.0",
-            "attn.head.0.1",
-            "attn.head.1.0",
-            "attn.head.1.1",
-        ],
-        torch.tensor(
-            [
-                [1.0, 2.0, 10.0],
-                [3.0, 4.0, 20.0],
-                [5.0, 6.0, 30.0],
-                [7.0, 8.0, 40.0],
-            ]
-        ),
-    )
-
-    matrix, bias = reader.read_head_matrix("attn", num_heads=2, head_dim=2)
-
-    torch.testing.assert_close(
-        matrix,
-        torch.tensor(
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-                [5.0, 6.0],
-                [7.0, 8.0],
-            ]
-        ),
-    )
-    torch.testing.assert_close(bias, torch.tensor([10.0, 20.0, 30.0, 40.0]))
-
-
-def test_read_bias_requires_padded_nan_sentinel():
-    reader = make_reader(["proj.bias"], torch.tensor([[1.0, 2.0, 3.0]]))
-
-    with pytest.raises(AssertionError, match="Expected padded bias row"):
-        reader.read_bias("proj")
-
-
-def test_read_optional_layernorm_strips_padding_and_validates_nan_sentinel():
-    reader = make_reader(
-        ["norm.weight", "norm.bias"],
-        torch.tensor(
-            [
-                [1.0, 2.0, float("nan")],
-                [3.0, 4.0, float("nan")],
-            ]
-        ),
-    )
-
-    rows = reader.read_optional_layernorm("norm")
-
-    torch.testing.assert_close(rows, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-
-
-def test_read_optional_layernorm_rejects_non_nan_padding():
-    reader = make_reader(
-        ["norm.weight", "norm.bias"],
-        torch.tensor(
-            [
-                [1.0, 2.0, float("nan")],
-                [3.0, 4.0, 5.0],
-            ]
-        ),
-    )
-
-    with pytest.raises(AssertionError, match="Expected padded LayerNorm rows"):
-        reader.read_optional_layernorm("norm")
-
-
 def test_assert_done_rejects_unconsumed_rows():
-    reader = make_reader(
-        ["block.0", "block.1"],
-        torch.tensor(
-            [
-                [1.0, 2.0],
-                [3.0, 4.0],
-            ]
-        ),
-    )
+    reader = SerializedParameterReader(make_named(["block.0", "block.1"], [[1.0, 2.0], [3.0, 4.0]]))
     reader.take(["block.0"])
 
     with pytest.raises(AssertionError, match="Unused serialized rows remain"):
         reader.assert_done()
-
-
-def test_assert_done_passes_after_full_consumption():
-    reader = make_reader(["block.0"], torch.tensor([[1.0, 2.0]]))
-
-    reader.take(["block.0"])
-
-    reader.assert_done()

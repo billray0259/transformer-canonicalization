@@ -10,6 +10,7 @@ from lib.serial_model import SerialAutoModelForMaskedLM
 SERIAL_METHOD_NAMES = (
     "serialize_matrix",
     "serialize_bias",
+    "serialize_head_biases",
     "serialize_layernorm",
     "serialize_embeddings",
     "serialize_attention",

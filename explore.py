@@ -1,44 +1,38 @@
 # %%
 from lib.serial_model import SerialAutoModelForMaskedLM
-from lib.serial_params import NamedSerialParameters
 import torch
-import random
 from tqdm import tqdm
 # %%
 # Load MultiBERT seed 0 from Hugging Face
 model_name = "google/multiberts-seed_0"
 serial_model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
-serialize_params = serial_model.serialize() 
-# %%
-
-names = serialize_params.names
-vectors = serialize_params.vectors
-
-# %%
-print(sum(["head.0" in name for name in names]))
-
-# %%
-
-nan_count = sum(torch.isnan(v[-1]) if isinstance(v, torch.Tensor) and v.numel() > 0 else False for v in vectors)
-print(f"Rows with NaN in last column: {nan_count}")
-
-total_nans = sum(torch.isnan(v).sum().item() if isinstance(v, torch.Tensor) else 0 for v in vectors)
-print(f"Total NaN values: {total_nans}")
-
-print(f"Total Rows: {len(vectors)}")
-# %%
-
-has_nan_mask = torch.tensor([torch.isnan(v[-1]) if isinstance(v, torch.Tensor) and v.numel() > 0 else False for v in vectors])
-nan_names = [name for name, has_nan in zip(names, has_nan_mask) if has_nan]
-print(f"10 names of rows with NaN in last column: {random.sample(nan_names, min(10, len(nan_names)))}")
-# %%
-
+multi_params = serial_model.serialize()
 
     
 # %%
-
-
-
+for key, item in multi_params.items():
+    equiv_class = multi_params.get_equivalence_class(key)
+    print(f"{key} {tuple(item.vectors.shape)} {equiv_class}")
 
     
 # %%
+def random_permutation(size: int, device: torch.device = "cpu") -> torch.Tensor:
+    return torch.eye(size, device=device)[torch.randperm(size, device=device)]
+
+stream_names = list(multi_params)
+for stream_name in tqdm(stream_names):
+    named_params = multi_params[stream_name]
+    perm = random_permutation(named_params.vectors.shape[1], named_params.vectors.device)
+    multi_params.apply_square_matrix(perm, stream_name)
+
+# %% 
+permuted_model = SerialAutoModelForMaskedLM.from_serial_params(multi_params)
+
+# check that permuted model has the same activations as original model
+
+random_tokens = torch.randint(0, serial_model.config.vocab_size, (1, 10))
+with torch.no_grad():
+    original_output = serial_model(random_tokens).logits
+    permuted_output = permuted_model(random_tokens).logits
+    
+torch.testing.assert_close(original_output, permuted_output)

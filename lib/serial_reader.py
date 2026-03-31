@@ -1,29 +1,25 @@
 import torch
 
-from lib.serial_params import NamedSerialParameters
+from lib.serial_params import MultiStreamSerialParameters, NamedSerialParameters
 
 
 
 class SerializedParameterReader:
     """Consumes serialized parameter rows in the expected order."""
 
-    @staticmethod
-    def split_matrix_and_bias(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Split serialized rows into a matrix block and optional inline bias."""
-        # rows: (row_count, hidden_size + 1) -> matrix: (row_count, hidden_size)
-        matrix = rows[:, :-1]
-        # bias_column: (row_count,), where NaN means "no inline bias"
-        bias_column = rows[:, -1]
-        has_bias = ~torch.isnan(bias_column)
-        assert bool(has_bias.all() or (~has_bias).all()), "Serialized rows mix padded and non-padded bias columns."
-        bias = None if bool((~has_bias).all()) else bias_column
-        return matrix, bias
-
-    def __init__(self, serialized_params: NamedSerialParameters) -> None:
-        """Initialize the reader over a flat serialized parameter stream."""
+    def __init__(
+        self,
+        serialized_params: NamedSerialParameters | MultiStreamSerialParameters,
+        stream_name: str | None = None,
+    ) -> None:
+        """Initialize the reader over one serialized parameter stream."""
+        if isinstance(serialized_params, MultiStreamSerialParameters):
+            assert stream_name is not None, "A stream name is required for multistream serialized parameters."
+            serialized_params = serialized_params.get(stream_name, NamedSerialParameters())
         self.names = serialized_params.names
         self.vectors = serialized_params.vectors
-        assert self.vectors is not None, "Serialized parameters must include vectors."
+        if self.vectors is None:
+            self.vectors = torch.empty((0, 0))
         assert len(self.names) == self.vectors.shape[0], "Serialized names and vectors must have the same length."
         self.index = 0
 
@@ -37,6 +33,10 @@ class SerializedParameterReader:
         """Check whether the next row name starts with the given prefix."""
         name = self.peek()
         return name is not None and name.startswith(prefix)
+
+    def has_prefix(self, prefix: str) -> bool:
+        """Check whether any row name starts with the given prefix."""
+        return any(name.startswith(prefix) for name in self.names)
 
     def take(self, expected_names: list[str]) -> torch.Tensor:
         """Consume a fixed sequence of named rows and return their tensor block."""
@@ -53,38 +53,129 @@ class SerializedParameterReader:
             return None
         return self.take([f"{prefix}.weight", f"{prefix}.bias"])
 
-    def read_matrix(self, prefix: str, row_count: int) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Read a standard row-wise matrix block with an optional inline bias column."""
-        # Expected serialized block shape: (row_count, hidden_size + 1)
-        rows = self.take([f"{prefix}.{i}" for i in range(row_count)])
-        return self.split_matrix_and_bias(rows)
+    def read_matrix(self, prefix: str, row_count: int) -> torch.Tensor:
+        """Read a standard row-wise matrix block."""
+        return self.take([f"{prefix}.{i}" for i in range(row_count)])
 
-    def read_head_matrix(self, prefix: str, num_heads: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def read_head_matrix(self, prefix: str, num_heads: int, head_dim: int) -> torch.Tensor:
         """Read a head-indexed matrix block using the serialized attention naming scheme."""
-        # Head-indexed blocks still flatten to (num_heads * head_dim, hidden_size + 1)
-        rows = self.take([
+        return self.take([
             f"{prefix}.head.{head_idx}.{row_idx}"
             for head_idx in range(num_heads)
             for row_idx in range(head_dim)
         ])
-        return self.split_matrix_and_bias(rows)
 
     def read_bias(self, prefix: str) -> torch.Tensor:
-        """Read a standalone bias row padded with a trailing NaN sentinel."""
-        rows = self.take([f"{prefix}.bias"])
-        # rows[0, :-1]: (hidden_size,)
-        assert torch.isnan(rows[0, -1]), f"Expected padded bias row for {prefix}."
-        return rows[0, :-1]
+        """Read a standalone bias row."""
+        return self.take([f"{prefix}.bias"])[0]
+
+    def read_head_bias(self, prefix: str, head_idx: int) -> torch.Tensor:
+        """Read one head-partitioned bias row."""
+        return self.take([f"{prefix}.head.{head_idx}.bias"])[0]
 
     def read_optional_layernorm(self, prefix: str) -> torch.Tensor | None:
-        """Read a LayerNorm weight/bias pair when present and validate sentinel padding."""
-        rows = self.take_optional_layernorm(prefix)
-        if rows is None:
-            return None
-        # rows: (2, hidden_size + 1) -> returned tensor: (2, hidden_size)
-        assert torch.isnan(rows[:, -1]).all(), f"Expected padded LayerNorm rows for {prefix}."
-        return rows[:, :-1]
+        """Read a LayerNorm weight/bias pair when present."""
+        return self.take_optional_layernorm(prefix)
 
     def assert_done(self) -> None:
         """Assert that the entire serialized stream has been consumed."""
         assert self.index == len(self.names), f"Unused serialized rows remain starting at {self.peek()}."
+
+
+class MultiStreamSerializedParameterReader:
+    """Lazily exposes per-stream readers over multistream serialized parameters."""
+
+    def __init__(self, serialized_params: NamedSerialParameters | MultiStreamSerialParameters) -> None:
+        if isinstance(serialized_params, NamedSerialParameters):
+            serialized_params = MultiStreamSerialParameters.from_stream_dict({"model": serialized_params})
+        self.serialized_params = serialized_params
+        self.readers = {
+            stream_name: SerializedParameterReader(serialized_params, stream_name)
+            for stream_name in serialized_params.stream_names
+        }
+
+    def __getitem__(self, stream_name: str) -> SerializedParameterReader:
+        if stream_name not in self.readers:
+            self.readers[stream_name] = SerializedParameterReader(self.serialized_params, stream_name)
+        return self.readers[stream_name]
+
+    def assert_done(self) -> None:
+        for reader in self.readers.values():
+            reader.assert_done()
+
+
+class SerializedParameterOverrides(dict):
+    """Collects functional_call overrides while reading from serialized parameter streams."""
+
+    def __init__(self, serialized_params: NamedSerialParameters | MultiStreamSerialParameters) -> None:
+        super().__init__()
+        self.readers = MultiStreamSerializedParameterReader(serialized_params)
+
+    def has_prefix(self, prefix: str, stream: str | None = None) -> bool:
+        if stream is not None:
+            return self.readers[stream].has_prefix(prefix)
+        return any(self.readers[stream_name].has_prefix(prefix) for stream_name in self.readers.serialized_params.stream_names)
+
+    def matrix(
+        self,
+        key: str,
+        row_count: int,
+        *,
+        stream: str = "model",
+        src: str | None = None,
+        transpose: bool = False,
+    ) -> torch.Tensor:
+        value = self.readers[stream].read_matrix(src or key, row_count)
+        self[key] = value.T if transpose else value
+        return self[key]
+
+    def head_matrix(
+        self,
+        key: str,
+        *,
+        num_heads: int,
+        head_dim: int,
+        stream: str = "model",
+        src: str | None = None,
+        transpose: bool = False,
+    ) -> torch.Tensor:
+        value = self.readers[stream].read_head_matrix(src or key, num_heads, head_dim)
+        self[key] = value.T if transpose else value
+        return self[key]
+
+    def bias(self, key: str, *, stream: str = "model", src: str | None = None) -> torch.Tensor:
+        self[key] = self.readers[stream].read_bias(src or key.removesuffix(".bias"))
+        return self[key]
+
+    def head_bias(
+        self,
+        key: str,
+        *,
+        stream_names: list[str],
+        src: str | None = None,
+    ) -> torch.Tensor:
+        prefix = src or key.removesuffix(".bias")
+        self[key] = torch.cat(
+            [
+                self.readers[stream_name].read_head_bias(prefix, head_idx)
+                for head_idx, stream_name in enumerate(stream_names)
+            ]
+        )
+        return self[key]
+
+    def optional_layernorm(
+        self,
+        key_prefix: str,
+        *,
+        stream: str = "model",
+        src: str | None = None,
+    ) -> torch.Tensor | None:
+        rows = self.readers[stream].read_optional_layernorm(src or key_prefix)
+        if rows is None:
+            return None
+        self[f"{key_prefix}.weight"] = rows[0]
+        self[f"{key_prefix}.bias"] = rows[1]
+        return rows
+
+    def assert_done(self) -> None:
+        self.readers.assert_done()

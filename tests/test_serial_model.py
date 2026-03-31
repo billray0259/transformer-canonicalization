@@ -1,18 +1,18 @@
-import math
 from types import MethodType
 
 import pytest
 import torch
 from torch.func import functional_call
-from transformers import AutoModelForMaskedLM, AutoTokenizer, BertForMaskedLM
+from transformers import AutoModelForMaskedLM, BertForMaskedLM
 
 from lib.serial_model import SerialAutoModelForMaskedLM
-from lib.serial_params import NamedSerialParameters
-from lib.utils import masked_token_pseudo_perplexity
+from lib.serial_params import MultiStreamSerialParameters, NamedSerialParameters
+from lib.serial_reader import SerializedParameterOverrides
 
 SERIAL_METHOD_NAMES = (
     "serialize_matrix",
     "serialize_bias",
+    "serialize_head_biases",
     "serialize_layernorm",
     "serialize_embeddings",
     "serialize_attention",
@@ -21,29 +21,6 @@ SERIAL_METHOD_NAMES = (
     "serialize_mlm_head",
     "serialize",
 )
-
-
-def attach_serial_methods(model):
-    for method_name in SERIAL_METHOD_NAMES:
-        method = getattr(SerialAutoModelForMaskedLM, method_name)
-        setattr(model, method_name, MethodType(method, model))
-    return model
-
-
-def patch_working_serialize_bias(model):
-    def fixed_serialize_bias(self, bias, name=None):
-        assert bias.shape[0] == self.config.hidden_size, "Bias must have the same size as the model's hidden size."
-        names = [f"{name}.bias" if name is not None else "bias"]
-        padded_bias = torch.cat(
-            [bias.unsqueeze(0), torch.full((1, 1), float("nan"), device=bias.device, dtype=bias.dtype)],
-            dim=1,
-        )
-        from lib.serial_params import NamedSerialParameters
-
-        return NamedSerialParameters.from_vector_list(names, [padded_bias])
-
-    model.serialize_bias = MethodType(fixed_serialize_bias, model)
-    return model
 
 
 def has_tied_input_output_embeddings(model):
@@ -67,36 +44,33 @@ def build_shell_model(tiny_config, seed=1234):
     return model
 
 
-def load_pretrained_serial_model_or_skip(model_name="google/multiberts-seed_0"):
-    try:
-        model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
-    except Exception as exc:
-        pytest.skip(f"Could not load pretrained model {model_name}: {exc}")
-
-    model.eval()
-    return model
-
-
-def load_tokenizer_or_skip(model_name="google/multiberts-seed_0"):
-    try:
-        return AutoTokenizer.from_pretrained(model_name)
-    except Exception as exc:
-        pytest.skip(f"Could not load tokenizer for {model_name}: {exc}")
+def clone_stream(stream):
+    if stream.vectors is None:
+        return NamedSerialParameters()
+    return NamedSerialParameters.from_vector_list(
+        stream.names,
+        [stream.vectors.detach().clone().requires_grad_(True)],
+    )
 
 
-def run_and_capture_self_attention_context(model, layer_index, run_forward):
-    captured = {}
-
-    def hook(_module, _inputs, outputs):
-        captured["context"] = outputs[0].detach().clone()
-
-    handle = model.base_model.encoder.layer[layer_index].attention.self.register_forward_hook(hook)
-    try:
-        run_forward()
-    finally:
-        handle.remove()
-
-    return captured["context"]
+def clone_multistream(serialized):
+    return MultiStreamSerialParameters.from_stream_dict(
+        {
+            stream_name: (
+                NamedSerialParameters()
+                if stream.vectors is None
+                else NamedSerialParameters.from_vector_list(
+                    stream.names,
+                    [stream.vectors.detach().clone()],
+                )
+            )
+            for stream_name, stream in serialized.items()
+        },
+        equivalence_classes={
+            stream_name: set(prefixes)
+            for stream_name, prefixes in serialized.equivalence_classes.items()
+        },
+    )
 
 
 def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_config):
@@ -116,265 +90,141 @@ def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_
     for method_name in SERIAL_METHOD_NAMES:
         method = getattr(loaded_model, method_name)
         assert callable(method)
+        assert isinstance(method, MethodType)
         assert method.__self__ is dummy_model
 
 
-def test_serialize_matrix_without_bias_pads_nan_column(tiny_serial_model):
-    matrix = torch.arange(12, dtype=torch.float32).view(3, 4)
+def test_serialize_attention_routes_weights_and_biases_into_expected_streams(tiny_serial_model):
+    attention = tiny_serial_model.base_model.encoder.layer[0].attention
 
-    serialized = tiny_serial_model.serialize_matrix(matrix, name="proj")
+    serialized = tiny_serial_model.serialize_attention(attention, layer_idx=0, name="attn")
 
-    assert serialized.names == ["proj.0", "proj.1", "proj.2"]
-    assert serialized.vectors.shape == (3, 5)
-    torch.testing.assert_close(serialized.vectors[:, :4], matrix)
-    assert torch.isnan(serialized.vectors[:, 4]).all()
-
-
-def test_serialize_matrix_with_bias_appends_bias_as_last_column(tiny_serial_model):
-    matrix = torch.arange(8, dtype=torch.float32).view(2, 4)
-    bias = torch.tensor([0.5, -1.5])
-
-    serialized = tiny_serial_model.serialize_matrix(matrix, name="proj", bias=bias)
-
-    assert serialized.names == ["proj.0", "proj.1"]
-    assert serialized.vectors.shape == (2, 5)
-    torch.testing.assert_close(serialized.vectors[:, :4], matrix)
-    torch.testing.assert_close(serialized.vectors[:, 4], bias)
-
-
-def test_serialize_matrix_rejects_hidden_size_mismatch(tiny_serial_model):
-    matrix = torch.randn(2, 5)
-
-    with pytest.raises(AssertionError, match="hidden size"):
-        tiny_serial_model.serialize_matrix(matrix)
-
-
-def test_serialize_bias_creates_single_padded_row(tiny_serial_model):
-    bias = torch.tensor([1.0, 2.0, 3.0, 4.0])
-
-    serialized = tiny_serial_model.serialize_bias(bias, name="proj")
-
-    assert serialized.names == ["proj.bias"]
-    assert serialized.vectors.shape == (1, 5)
-    torch.testing.assert_close(serialized.vectors[0, :4], bias)
-    assert torch.isnan(serialized.vectors[0, 4])
+    assert serialized.stream_names == [
+        "model",
+        "L0.H0.qk",
+        "L0.H1.qk",
+        "L0.H0.ov",
+        "L0.H1.ov",
+    ]
+    assert serialized["L0.H0.qk"].names == ["attn.self.query.head.0.bias", "attn.self.key.head.0.bias"]
+    assert serialized["L0.H1.qk"].names == ["attn.self.query.head.1.bias", "attn.self.key.head.1.bias"]
+    assert serialized["L0.H0.ov"].names == ["attn.self.value.head.0.bias"]
+    assert serialized["L0.H1.ov"].names == ["attn.self.value.head.1.bias"]
+    assert serialized.get_equivalence_class("L0.H0.qk") == {
+        "attn.self.query.weight.head.0",
+        "attn.self.key.weight.head.0",
+    }
+    assert serialized.get_equivalence_class("L0.H0.ov") == {
+        "attn.self.value.weight.head.0",
+        "attn.output.dense.weight.head.0",
+    }
+    assert "attn.output.dense.bias" in serialized["model"].names
+    torch.testing.assert_close(serialized["model"].vectors[0], attention.self.query.weight[0])
+    torch.testing.assert_close(serialized["L0.H0.qk"].vectors[0], attention.self.query.bias[:2])
+    torch.testing.assert_close(serialized["L0.H1.qk"].vectors[0], attention.self.query.bias[2:])
+    torch.testing.assert_close(serialized["L0.H0.ov"].vectors[0], attention.self.value.bias[:2])
+    torch.testing.assert_close(serialized["L0.H1.ov"].vectors[0], attention.self.value.bias[2:])
 
 
-def test_serialize_bias_rejects_hidden_size_mismatch(tiny_serial_model):
-    with pytest.raises(AssertionError, match="same size as the model's hidden size"):
-        tiny_serial_model.serialize_bias(torch.randn(3), name="proj")
+def test_serialize_encoder_layer_routes_mlp_bias_to_layer_stream(tiny_serial_model):
+    layer = tiny_serial_model.base_model.encoder.layer[0]
+
+    serialized = tiny_serial_model.serialize_encoder_layer(layer, layer_idx=0, name="encoder.layer.0")
+
+    assert serialized["L0.mlp"].names == ["encoder.layer.0.intermediate.dense.bias"]
+    assert serialized.get_equivalence_class("L0.mlp") == {
+        "encoder.layer.0.intermediate.dense",
+        "encoder.layer.0.output.dense.weight",
+    }
+    torch.testing.assert_close(serialized["L0.mlp"].vectors[0], layer.intermediate.dense.bias)
+    assert "encoder.layer.0.output.dense.bias" in serialized["model"].names
 
 
-def test_serialize_layernorm_uses_weight_and_bias_rows(tiny_serial_model):
-    layernorm = tiny_serial_model.base_model.embeddings.LayerNorm
+def test_equivalent_model_rows_return_same_class_weight_rows(tiny_serial_model):
+    serialized = tiny_serial_model.serialize_attention(
+        tiny_serial_model.base_model.encoder.layer[0].attention,
+        layer_idx=0,
+        name="attn",
+    )
 
-    serialized = tiny_serial_model.serialize_layernorm(layernorm, name="norm")
+    equivalent_rows = serialized.equivalent_model_rows("L0.H1.qk")
 
-    assert serialized.names == ["norm.weight", "norm.bias"]
-    assert serialized.vectors.shape == (2, 5)
-    torch.testing.assert_close(serialized.vectors[0, :4], layernorm.weight)
-    torch.testing.assert_close(serialized.vectors[1, :4], layernorm.bias)
-    assert torch.isnan(serialized.vectors[:, 4]).all()
-
-
-@pytest.mark.parametrize("tied_embeddings", [True, False])
-def test_serialize_embeddings_contains_expected_tables_and_layernorm(tiny_serial_model, tiny_config, tied_embeddings):
-    if not tied_embeddings:
-        untie_input_output_embeddings(tiny_serial_model)
-
-    serialized = tiny_serial_model.serialize_embeddings()
-    skips_word_embeddings = has_tied_input_output_embeddings(tiny_serial_model)
-    expected_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size + 2
-    if not skips_word_embeddings:
-        expected_rows += tiny_config.vocab_size
-
-    assert len(serialized.names) == expected_rows
-    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
-    if skips_word_embeddings:
-        assert serialized.names[:3] == [
-            "embeddings.position_embeddings.weight.0",
-            "embeddings.position_embeddings.weight.1",
-            "embeddings.position_embeddings.weight.2",
-        ]
-    else:
-        assert serialized.names[:3] == [
-            "embeddings.word_embeddings.weight.0",
-            "embeddings.word_embeddings.weight.1",
-            "embeddings.word_embeddings.weight.2",
-        ]
-    assert serialized.names[-2:] == ["embeddings.LayerNorm.weight", "embeddings.LayerNorm.bias"]
-    first_embedding_table = tiny_serial_model.base_model.embeddings.position_embeddings
-    if not skips_word_embeddings:
-        first_embedding_table = tiny_serial_model.base_model.embeddings.word_embeddings
-    torch.testing.assert_close(serialized.vectors[0, :4], first_embedding_table.weight[0])
-    assert torch.isnan(serialized.vectors[:, 4]).all()
+    assert equivalent_rows.names == [
+        "attn.self.query.weight.head.1.0",
+        "attn.self.query.weight.head.1.1",
+        "attn.self.key.weight.head.1.0",
+        "attn.self.key.weight.head.1.1",
+    ]
 
 
-def test_serialize_embeddings_skips_missing_layernorm(tiny_serial_model, tiny_config):
+def test_serialize_merges_tied_decoder_aux_rows_into_model_stream(tiny_serial_model):
+    serialized = tiny_serial_model.serialize()
+
+    assert has_tied_input_output_embeddings(tiny_serial_model)
+    assert "decoder" not in serialized
+    assert "cls.predictions.transform.dense.bias" in serialized["model"].names
+    assert "cls.predictions.transform.LayerNorm.weight" in serialized["model"].names
+    assert all(not name.startswith("cls.predictions.decoder.weight") for name in serialized["model"].names)
+    assert serialized["vocab"].names == ["cls.predictions.decoder.bias"]
+
+
+def test_serialize_keeps_decoder_stream_when_embeddings_are_untied(tiny_serial_model):
+    untie_input_output_embeddings(tiny_serial_model)
+
+    serialized = tiny_serial_model.serialize()
+
+    assert not has_tied_input_output_embeddings(tiny_serial_model)
+    assert "decoder" in serialized
+    assert "cls.predictions.transform.dense.bias" in serialized["decoder"].names
+    assert f"cls.predictions.decoder.weight.{tiny_serial_model.config.vocab_size - 1}" in serialized["decoder"].names
+
+
+def test_serialize_helpers_cover_default_and_custom_naming_paths(tiny_serial_model):
     tiny_serial_model.base_model.embeddings.LayerNorm = None
+    tiny_serial_model.base_model.encoder.layer[0].output.LayerNorm = None
 
-    serialized = tiny_serial_model.serialize_embeddings()
-    expected_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size
-    if not has_tied_input_output_embeddings(tiny_serial_model):
-        expected_rows += tiny_config.vocab_size
+    embeddings = tiny_serial_model.serialize_embeddings(name="custom.embeddings")
+    attention = tiny_serial_model.serialize_attention(tiny_serial_model.base_model.encoder.layer[0].attention, layer_idx=0)
+    encoder_layer = tiny_serial_model.serialize_encoder_layer(tiny_serial_model.base_model.encoder.layer[0], layer_idx=0)
+    encoder = tiny_serial_model.serialize_encoder(name="custom.encoder")
 
-    assert len(serialized.names) == expected_rows
-    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
-    assert all("LayerNorm" not in name for name in serialized.names)
-
-
-def test_serialize_attention_serializes_read_biases_inline_and_write_bias_separately(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    attention = tiny_serial_model.base_model.encoder.layer[0].attention
-
-    serialized = tiny_serial_model.serialize_attention(attention, name="attn")
-
-    assert len(serialized.names) == 19
-    assert serialized.vectors.shape == (19, tiny_config.hidden_size + 1)
-    assert serialized.names[0] == "attn.self.query.head.0.0"
-    assert serialized.names[1] == "attn.self.query.head.0.1"
-    assert serialized.names[2] == "attn.self.query.head.1.0"
-    assert serialized.names[12] == "attn.output.dense.weight.head.0.0"
-    assert serialized.names[16] == "attn.output.dense.bias"
-    assert serialized.names[-2:] == ["attn.output.LayerNorm.weight", "attn.output.LayerNorm.bias"]
-    torch.testing.assert_close(serialized.vectors[0, :4], attention.self.query.weight[0])
-    torch.testing.assert_close(serialized.vectors[:4, 4], attention.self.query.bias)
-    torch.testing.assert_close(serialized.vectors[12, :4], attention.output.dense.weight.T[0])
-    assert torch.isnan(serialized.vectors[12:16, 4]).all()
-    torch.testing.assert_close(serialized.vectors[16, :4], attention.output.dense.bias)
-    assert torch.isnan(serialized.vectors[16, 4])
+    assert all(not name.startswith("custom.embeddings.LayerNorm") for name in embeddings.names)
+    assert attention["model"].names[0].startswith("bert.encoder.layer.0.attention.self.query.weight")
+    assert "bert.encoder.layer.0.output.dense.bias" in encoder_layer["model"].names
+    assert "custom.encoder.layer.0.intermediate.dense.0" in encoder["model"].names
 
 
-def test_serialize_attention_skips_missing_output_layernorm(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    attention = tiny_serial_model.base_model.encoder.layer[0].attention
-    attention.output.LayerNorm = None
+def test_deserialize_helpers_accept_custom_prefixes(tiny_serial_model, tiny_config):
+    shell_model = build_shell_model(tiny_config, seed=999)
 
-    serialized = tiny_serial_model.serialize_attention(attention, name="attn")
-
-    assert len(serialized.names) == 17
-    assert serialized.vectors.shape == (17, tiny_config.hidden_size + 1)
-    assert all("output.LayerNorm" not in name for name in serialized.names)
-
-
-def test_serialize_encoder_layer_inlines_intermediate_bias_and_separates_output_bias(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    layer = tiny_serial_model.base_model.encoder.layer[0]
-
-    serialized = tiny_serial_model.serialize_encoder_layer(layer, name="encoder.layer.0")
-
-    assert len(serialized.names) == 38
-    assert serialized.vectors.shape == (38, tiny_config.hidden_size + 1)
-    assert "encoder.layer.0.intermediate.dense.0" in serialized.names
-    assert "encoder.layer.0.output.dense.bias" in serialized.names
-    assert all(not name.startswith("encoder.layer.0.intermediate.dense.bias") for name in serialized.names)
-    intermediate_start = serialized.names.index("encoder.layer.0.intermediate.dense.0")
-    torch.testing.assert_close(
-        serialized.vectors[intermediate_start:intermediate_start + 8, 4],
-        layer.intermediate.dense.bias,
+    embedding_overrides = SerializedParameterOverrides(
+        MultiStreamSerialParameters.from_stream_dict(
+            {"model": tiny_serial_model.serialize_embeddings(name="custom.embeddings")}
+        )
     )
+    encoder_overrides = SerializedParameterOverrides(tiny_serial_model.serialize_encoder(name="custom.encoder"))
+
+    SerialAutoModelForMaskedLM._deserialize_embeddings(shell_model, embedding_overrides, name="custom.embeddings")
+    SerialAutoModelForMaskedLM._deserialize_encoder(shell_model, encoder_overrides, name="custom.encoder")
+
+    embedding_overrides.assert_done()
+    encoder_overrides.assert_done()
 
 
-def test_serialize_encoder_layer_skips_missing_output_layernorm(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    layer = tiny_serial_model.base_model.encoder.layer[0]
-    layer.output.LayerNorm = None
+def test_serialize_handles_tied_models_even_when_decoder_stream_is_absent(monkeypatch, tiny_serial_model):
+    def fake_serialize_mlm_head(self, name="cls.predictions"):
+        return MultiStreamSerialParameters.from_stream_dict(
+            {
+                "model": NamedSerialParameters(),
+                "vocab": NamedSerialParameters(),
+            }
+        )
 
-    serialized = tiny_serial_model.serialize_encoder_layer(layer, name="encoder.layer.0")
+    monkeypatch.setattr(tiny_serial_model, "serialize_mlm_head", MethodType(fake_serialize_mlm_head, tiny_serial_model))
 
-    assert len(serialized.names) == 36
-    assert serialized.vectors.shape == (36, tiny_config.hidden_size + 1)
-    assert all(
-        not name.startswith("encoder.layer.0.output.LayerNorm")
-        for name in serialized.names
-    )
-
-
-def test_serialize_mlm_head_inlines_transform_and_decoder_biases(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    serialized = tiny_serial_model.serialize_mlm_head()
-
-    assert len(serialized.names) == 17
-    assert serialized.vectors.shape == (17, tiny_config.hidden_size + 1)
-    transform_start = serialized.names.index("predictions.transform.dense.weight.0")
-    decoder_start = serialized.names.index("predictions.decoder.weight.0")
-    torch.testing.assert_close(
-        serialized.vectors[transform_start:transform_start + 4, 4],
-        tiny_serial_model.cls.predictions.transform.dense.bias,
-    )
-    torch.testing.assert_close(
-        serialized.vectors[decoder_start:decoder_start + tiny_config.vocab_size, 4],
-        tiny_serial_model.cls.predictions.bias,
-    )
-
-
-def test_serialize_mlm_head_skips_missing_layernorm(tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
-    tiny_serial_model.cls.predictions.transform.LayerNorm = None
-
-    serialized = tiny_serial_model.serialize_mlm_head()
-
-    assert len(serialized.names) == tiny_config.hidden_size + tiny_config.vocab_size
-    assert serialized.vectors.shape == (15, tiny_config.hidden_size + 1)
-    assert all("transform.LayerNorm" not in name for name in serialized.names)
-    torch.testing.assert_close(serialized.vectors[-1, -1], tiny_serial_model.cls.predictions.bias[-1])
-
-
-@pytest.mark.parametrize("tied_embeddings", [True, False])
-def test_serialize_aggregates_embeddings_encoder_and_mlm_head(tiny_serial_model, tiny_config, tied_embeddings):
-    if not tied_embeddings:
-        untie_input_output_embeddings(tiny_serial_model)
-
-    patch_working_serialize_bias(tiny_serial_model)
     serialized = tiny_serial_model.serialize()
 
-    embedding_rows = tiny_config.max_position_embeddings + tiny_config.type_vocab_size + 2
-    if not has_tied_input_output_embeddings(tiny_serial_model):
-        embedding_rows += tiny_config.vocab_size
-    expected_rows = embedding_rows + tiny_config.num_hidden_layers * 38 + 17
-
-    assert len(serialized.names) == expected_rows
-    assert serialized.vectors.shape == (expected_rows, tiny_config.hidden_size + 1)
-
-
-@pytest.mark.parametrize("tied_embeddings", [True, False])
-def test_serialize_parameter_count_matches_expected_padding_overhead(tiny_serial_model, tiny_config, tied_embeddings):
-    if not tied_embeddings:
-        untie_input_output_embeddings(tiny_serial_model)
-
-    patch_working_serialize_bias(tiny_serial_model)
-
-    original_parameter_count = sum(parameter.numel() for parameter in tiny_serial_model.parameters())
-    serialized = tiny_serial_model.serialize()
-    serialized_parameter_count = serialized.vectors.numel()
-
-    expected_extra_parameters = (
-        + tiny_config.max_position_embeddings
-        + tiny_config.type_vocab_size
-        + 2
-        + tiny_config.num_hidden_layers * (tiny_config.hidden_size + tiny_config.intermediate_size + 6)
-        + 2
-    )
-
-    if not has_tied_input_output_embeddings(tiny_serial_model):
-        expected_extra_parameters += tiny_config.vocab_size
-
-    assert serialized_parameter_count - original_parameter_count == expected_extra_parameters
-    assert serialized_parameter_count == original_parameter_count + expected_extra_parameters
-
-
-@pytest.mark.parametrize("tied_embeddings", [True, False])
-def test_serialize_preserves_non_nan_parameter_count(tiny_serial_model, tied_embeddings):
-    if not tied_embeddings:
-        untie_input_output_embeddings(tiny_serial_model)
-
-    patch_working_serialize_bias(tiny_serial_model)
-
-    original_parameter_count = sum(parameter.numel() for parameter in tiny_serial_model.parameters())
-    serialized = tiny_serial_model.serialize()
-    non_nan_serialized_parameter_count = torch.count_nonzero(~torch.isnan(serialized.vectors)).item()
-
-    assert non_nan_serialized_parameter_count == original_parameter_count
+    assert "decoder" not in serialized
 
 
 @pytest.mark.parametrize("tied_embeddings", [True, False])
@@ -383,7 +233,6 @@ def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_serial_m
     if not tied_embeddings:
         untie_input_output_embeddings(source_model)
 
-    patch_working_serialize_bias(source_model)
     serialized = source_model.serialize()
     shell_model = build_shell_model(tiny_config, seed=4321)
     input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
@@ -411,15 +260,13 @@ def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_serial_m
     torch.testing.assert_close(loaded_outputs.logits, source_outputs.logits)
 
 
-def test_load_serialized_restores_missing_optional_layernorms(monkeypatch, tiny_serial_model, tiny_config):
-    source_model = tiny_serial_model
-    patch_working_serialize_bias(source_model)
-    source_model.base_model.embeddings.LayerNorm = None
-    source_model.base_model.encoder.layer[0].attention.output.LayerNorm = None
-    source_model.base_model.encoder.layer[1].output.LayerNorm = None
-    source_model.cls.predictions.transform.LayerNorm = None
+def test_serialize_and_load_handle_missing_optional_layernorms(monkeypatch, tiny_serial_model, tiny_config):
+    tiny_serial_model.base_model.embeddings.LayerNorm = None
+    tiny_serial_model.base_model.encoder.layer[0].attention.output.LayerNorm = None
+    tiny_serial_model.base_model.encoder.layer[1].output.LayerNorm = None
+    tiny_serial_model.cls.predictions.transform.LayerNorm = None
 
-    serialized = source_model.serialize()
+    serialized = tiny_serial_model.serialize()
     shell_model = build_shell_model(tiny_config)
 
     def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -441,11 +288,15 @@ def test_load_serialized_restores_missing_optional_layernorms(monkeypatch, tiny_
 
 
 def test_load_serialized_rejects_unexpected_row_names(monkeypatch, tiny_serial_model, tiny_config):
-    patch_working_serialize_bias(tiny_serial_model)
     serialized = tiny_serial_model.serialize()
-    broken_serialized = NamedSerialParameters.from_vector_list(
-        ["wrong.prefix"] + serialized.names[1:],
-        [serialized.vectors],
+    broken_serialized = MultiStreamSerialParameters.from_stream_dict(
+        {
+            **serialized,
+            "model": NamedSerialParameters.from_vector_list(
+                ["wrong.prefix", *serialized["model"].names[1:]],
+                [serialized["model"].vectors],
+            ),
+        }
     )
     shell_model = build_shell_model(tiny_config)
 
@@ -459,12 +310,29 @@ def test_load_serialized_rejects_unexpected_row_names(monkeypatch, tiny_serial_m
         SerialAutoModelForMaskedLM.load_serialized(broken_serialized, "dummy-model")
 
 
-def test_load_serialized_backprops_to_serialized_vectors(monkeypatch, tiny_serial_model, tiny_config):
-    source_model = tiny_serial_model
-    patch_working_serialize_bias(source_model)
-    serialized = source_model.serialize()
-    differentiable_vectors = serialized.vectors.detach().clone().requires_grad_(True)
-    differentiable_serialized = NamedSerialParameters.from_vector_list(serialized.names, [differentiable_vectors])
+def test_load_serialized_rejects_flat_named_serialized_params(monkeypatch, tiny_serial_model, tiny_config):
+    flat_serialized = NamedSerialParameters()
+    for stream_name in tiny_serial_model.serialize().stream_names:
+        flat_serialized += tiny_serial_model.serialize()[stream_name]
+
+    shell_model = build_shell_model(tiny_config)
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        assert pretrained_model_name_or_path == "dummy-model"
+        return shell_model
+
+    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
+
+    with pytest.raises(TypeError, match="MultiStreamSerialParameters"):
+        SerialAutoModelForMaskedLM.load_serialized(flat_serialized, "dummy-model")
+
+
+def test_load_serialized_backprops_to_multistream_vectors(monkeypatch, tiny_serial_model, tiny_config):
+    untie_input_output_embeddings(tiny_serial_model)
+    serialized = tiny_serial_model.serialize()
+    differentiable_serialized = MultiStreamSerialParameters.from_stream_dict(
+        {stream_name: clone_stream(stream) for stream_name, stream in serialized.items()}
+    )
     shell_model = build_shell_model(tiny_config, seed=5678)
     input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
 
@@ -481,107 +349,49 @@ def test_load_serialized_backprops_to_serialized_vectors(monkeypatch, tiny_seria
     loss = functional_call(functional_model, overrides, (), {"input_ids": input_ids}).logits.square().mean()
     loss.backward()
 
-    assert differentiable_vectors.grad is not None
-    assert torch.count_nonzero(differentiable_vectors.grad).item() > 0
+    grads = [
+        stream.vectors.grad
+        for stream in differentiable_serialized.values()
+        if stream.vectors is not None and stream.vectors.grad is not None
+    ]
+    assert grads
+    assert sum(torch.count_nonzero(grad).item() for grad in grads) > 0
 
 
-def test_load_serialized_zeroed_attention_head_only_affects_that_head(monkeypatch):
+def test_multibert_permutation_equivalence_classes_preserve_outputs():
     model_name = "google/multiberts-seed_0"
-    source_model = load_pretrained_serial_model_or_skip(model_name)
-    patch_working_serialize_bias(source_model)
+    try:
+        source_model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
+    except Exception as exc:
+        pytest.skip(f"Hugging Face model assets unavailable: {exc}")
+
+    source_model.eval()
     serialized = source_model.serialize()
-    modified_vectors = serialized.vectors.clone()
-    layer_index = 0
-    head_index = 0
-    head_dim = source_model.config.hidden_size // source_model.config.num_attention_heads
-    target_prefixes = [
-        f"encoder.layer.{layer_index}.attention.self.query.head.{head_index}.",
-        f"encoder.layer.{layer_index}.attention.self.key.head.{head_index}.",
-        f"encoder.layer.{layer_index}.attention.self.value.head.{head_index}.",
-        f"encoder.layer.{layer_index}.attention.output.dense.weight.head.{head_index}.",
+    permuted = clone_multistream(serialized)
+
+    torch.manual_seed(0)
+    permutable_stream_names = [
+        stream_name
+        for stream_name in permuted.stream_names
+        if permuted.get_equivalence_class(stream_name)
     ]
-    no_bias_prefix = f"encoder.layer.{layer_index}.attention.output.dense.weight.head.{head_index}."
-    target_rows = [
-        index
-        for index, name in enumerate(serialized.names)
-        if any(name.startswith(prefix) for prefix in target_prefixes)
-    ]
-    assert len(target_rows) == 4 * head_dim
-    for row_index in target_rows:
-        modified_vectors[row_index, :-1] = 0.0
-        if not serialized.names[row_index].startswith(no_bias_prefix):
-            modified_vectors[row_index, -1] = 0.0
-    modified_serialized = NamedSerialParameters.from_vector_list(serialized.names, [modified_vectors])
-    shell_model = load_pretrained_serial_model_or_skip(model_name)
-    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
-    attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    for stream_name in permutable_stream_names:
+        width = permuted[stream_name].vectors.shape[1]
+        permutation = torch.eye(width)[torch.randperm(width)]
+        permuted.apply_square_matrix(permutation, stream_name)
 
-    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        assert pretrained_model_name_or_path == model_name
-        return shell_model
+    permuted_model, overrides = SerialAutoModelForMaskedLM.load_serialized(permuted, model_name)
+    input_ids = torch.randint(0, source_model.config.vocab_size, (2, 8))
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0, 0]])
 
-    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
-
-    baseline_context = run_and_capture_self_attention_context(
-        source_model,
-        layer_index,
-        lambda: source_model(input_ids=input_ids, attention_mask=attention_mask),
-    )
-    loaded_model, overrides = SerialAutoModelForMaskedLM.load_serialized(modified_serialized, model_name)
-    zeroed_context = run_and_capture_self_attention_context(
-        loaded_model,
-        layer_index,
-        lambda: functional_call(
-            loaded_model,
+    with torch.no_grad():
+        source_logits = source_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        permuted_logits = functional_call(
+            permuted_model,
             overrides,
             (),
             {"input_ids": input_ids, "attention_mask": attention_mask},
-        ),
-    )
+        ).logits
 
-    baseline_context = baseline_context.view(
-        baseline_context.shape[0],
-        baseline_context.shape[1],
-        source_model.config.num_attention_heads,
-        head_dim,
-    )
-    zeroed_context = zeroed_context.view(
-        zeroed_context.shape[0],
-        zeroed_context.shape[1],
-        source_model.config.num_attention_heads,
-        head_dim,
-    )
-
-    assert torch.count_nonzero(baseline_context[:, :, head_index]).item() > 0
-    torch.testing.assert_close(
-        zeroed_context[:, :, head_index],
-        torch.zeros_like(zeroed_context[:, :, head_index]),
-    )
-    torch.testing.assert_close(
-        zeroed_context[:, :, 1 - head_index],
-        baseline_context[:, :, 1 - head_index],
-    )
-
-
-def test_load_serialized_ppl():
-    model_name = "google/multiberts-seed_0"
-    tokenizer = load_tokenizer_or_skip(model_name)
-    source_model = load_pretrained_serial_model_or_skip(model_name)
-    patch_working_serialize_bias(source_model)
-    serialized = source_model.serialize()
-
-    loaded_model, overrides = SerialAutoModelForMaskedLM.load_serialized(serialized, model_name)
-    loaded_model.eval()
-
-    perplexity = masked_token_pseudo_perplexity(
-        loaded_model,
-        tokenizer,
-        [
-            "The capital of France is Paris.",
-            "Water freezes at zero degrees Celsius.",
-        ],
-        overrides=overrides,
-    )
-
-    assert perplexity < 10
+    torch.testing.assert_close(permuted_logits, source_logits, atol=5e-5, rtol=1e-4)
 

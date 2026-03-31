@@ -53,18 +53,36 @@ def initialization_regularization_loss(model):
     )
     return torch.mean((model.encoder - encoder_target) ** 2) + torch.mean((model.decoder - decoder_target) ** 2)
 
+def permutation_invariant_bias_loss(model):
+    encoder_bias_row = model.encoder[-1]
+    decoder_weight_block = model.decoder[:, :-1]
+    decoder_bias_column = model.decoder[:, -1]
+    uniform_direction = torch.full(
+        (decoder_weight_block.shape[0],),
+        1.0 / (decoder_weight_block.shape[0] ** 0.5),
+        device=decoder_weight_block.device,
+        dtype=decoder_weight_block.dtype,
+    )
+
+    encoder_uniform_loss = torch.mean((encoder_bias_row - encoder_bias_row.mean()) ** 2)
+    decoder_uniform_loss = torch.mean((decoder_bias_column - decoder_bias_column.mean()) ** 2)
+    weight_leakage_loss = torch.mean((uniform_direction @ decoder_weight_block) ** 2)
+    return encoder_uniform_loss + decoder_uniform_loss + weight_leakage_loss
+
 def compute_loss_terms(model, batch):
     rec_loss = reconstruction_loss(model, batch)
     latent_loss = latent_preservation_loss(model, batch)
     bias_loss = bias_isolation_loss(model, batch)
     anc_loss = anchor_loss(model, batch)
     init_loss = initialization_regularization_loss(model)
+    invariant_bias_loss = permutation_invariant_bias_loss(model)
     return {
         "reconstruction_loss": rec_loss,
         "latent_preservation_loss": latent_loss,
         "bias_isolation_loss": bias_loss,
         "anchor_loss": anc_loss,
         "initialization_regularization_loss": init_loss,
+        "permutation_invariant_bias_loss": invariant_bias_loss,
     }
 
 def parse_args():
@@ -83,6 +101,7 @@ def parse_args():
     parser.add_argument("--bias-loss-weight", type=float, default=1.0)
     parser.add_argument("--anc-loss-weight", type=float, default=0.25)
     parser.add_argument("--init-loss-weight", type=float, default=0.1)
+    parser.add_argument("--invariant-bias-loss-weight", type=float, default=0.1)
     parser.add_argument("--disable-wandb", action="store_true", help="Skip Weights & Biases logging.")
     return parser.parse_args()
 
@@ -114,6 +133,7 @@ def main():
                 "bias_loss_weight": args.bias_loss_weight,
                 "anc_loss_weight": args.anc_loss_weight,
                 "init_loss_weight": args.init_loss_weight,
+                "invariant_bias_loss_weight": args.invariant_bias_loss_weight,
             },
         )
 
@@ -132,6 +152,7 @@ def main():
                 "train/bias_isolation_loss": 0.0,
                 "train/anchor_loss": 0.0,
                 "train/initialization_regularization_loss": 0.0,
+                "train/permutation_invariant_bias_loss": 0.0,
                 "train/total_loss": 0.0,
             }
             epoch_batches = 0
@@ -147,6 +168,7 @@ def main():
                     + args.bias_loss_weight * loss_terms["bias_isolation_loss"]
                     + args.anc_loss_weight * loss_terms["anchor_loss"]
                     + args.init_loss_weight * loss_terms["initialization_regularization_loss"]
+                    + args.invariant_bias_loss_weight * loss_terms["permutation_invariant_bias_loss"]
                 )
 
                 optimizer.zero_grad()
@@ -159,6 +181,7 @@ def main():
                     "train/bias_isolation_loss": loss_terms["bias_isolation_loss"].item(),
                     "train/anchor_loss": loss_terms["anchor_loss"].item(),
                     "train/initialization_regularization_loss": loss_terms["initialization_regularization_loss"].item(),
+                    "train/permutation_invariant_bias_loss": loss_terms["permutation_invariant_bias_loss"].item(),
                     "train/total_loss": total_loss.item(),
                     "train/epoch": epoch,
                     "train/global_step": global_step,
@@ -182,6 +205,7 @@ def main():
                             "validation/bias_isolation_loss": 0.0,
                             "validation/anchor_loss": 0.0,
                             "validation/initialization_regularization_loss": 0.0,
+                            "validation/permutation_invariant_bias_loss": 0.0,
                             "validation/total_loss": 0.0,
                         }
                         validation_batches = 0
@@ -194,12 +218,14 @@ def main():
                                 + args.bias_loss_weight * validation_terms["bias_isolation_loss"]
                                 + args.anc_loss_weight * validation_terms["anchor_loss"]
                                 + args.init_loss_weight * validation_terms["initialization_regularization_loss"]
+                                + args.invariant_bias_loss_weight * validation_terms["permutation_invariant_bias_loss"]
                             )
                             validation_totals["validation/reconstruction_loss"] += validation_terms["reconstruction_loss"].item()
                             validation_totals["validation/latent_preservation_loss"] += validation_terms["latent_preservation_loss"].item()
                             validation_totals["validation/bias_isolation_loss"] += validation_terms["bias_isolation_loss"].item()
                             validation_totals["validation/anchor_loss"] += validation_terms["anchor_loss"].item()
                             validation_totals["validation/initialization_regularization_loss"] += validation_terms["initialization_regularization_loss"].item()
+                            validation_totals["validation/permutation_invariant_bias_loss"] += validation_terms["permutation_invariant_bias_loss"].item()
                             validation_totals["validation/total_loss"] += validation_total_loss.item()
                             validation_batches += 1
                     model.train()
@@ -227,6 +253,7 @@ def main():
                             "epoch/bias_isolation_loss": epoch_totals["train/bias_isolation_loss"] / epoch_batches,
                             "epoch/anchor_loss": epoch_totals["train/anchor_loss"] / epoch_batches,
                             "epoch/initialization_regularization_loss": epoch_totals["train/initialization_regularization_loss"] / epoch_batches,
+                            "epoch/permutation_invariant_bias_loss": epoch_totals["train/permutation_invariant_bias_loss"] / epoch_batches,
                             "epoch/total_loss": epoch_loss,
                             "epoch/index": epoch,
                         },

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from lib.serial_params import NamedSerialParameters
+from lib.serial_params import MultiStreamSerialParameters, NamedSerialParameters
 
 
 def test_constructor_rejects_mismatched_name_count():
@@ -19,40 +19,229 @@ def test_empty_instance_has_no_names_and_no_vectors():
 def test_from_vector_list_concatenates_lazily_and_caches_result():
     first = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     second = torch.tensor([[5.0, 6.0]])
-    params = NamedSerialParameters.from_vector_list(
-        ["block.0", "block.1", "block.2"],
-        [first, second],
-    )
+    params = NamedSerialParameters.from_vector_list(["block.0", "block.1", "block.2"], [first, second])
 
     assert params._vectors is None
-
-    vectors = params.vectors
-
-    torch.testing.assert_close(vectors, torch.cat([first, second], dim=0))
-    assert params._vector_list == [vectors]
-    assert params.vectors.data_ptr() == vectors.data_ptr()
+    torch.testing.assert_close(params.vectors, torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+    assert params._vector_list == [params.vectors]
 
 
-def test_add_combines_names_and_vectors_without_mutating_inputs():
-    left = NamedSerialParameters.from_vector_list(["left.0"], [torch.tensor([[1.0, 2.0]])])
-    right = NamedSerialParameters.from_vector_list(
-        ["right.0", "right.1"],
-        [torch.tensor([[3.0, 4.0], [5.0, 6.0]])],
+def test_filter_preserves_row_structure():
+    params = NamedSerialParameters.from_vector_list(
+        ["keep.0", "drop.0", "keep.1"],
+        [torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])],
     )
+
+    filtered = params.filter(lambda name: name.startswith("keep"))
+
+    assert filtered.names == ["keep.0", "keep.1"]
+    torch.testing.assert_close(filtered.vectors, torch.tensor([[1.0, 2.0], [5.0, 6.0]]))
+
+
+def test_multistream_add_merges_matching_streams():
+    left = MultiStreamSerialParameters.from_stream_dict(
+        {"model": NamedSerialParameters.from_vector_list(["left.0"], [torch.tensor([[1.0, 2.0]])])}
+    )
+    right = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(["right.0"], [torch.tensor([[3.0, 4.0]])]),
+            "L0.mlp": NamedSerialParameters.from_vector_list(["bias.bias"], [torch.tensor([[5.0, 6.0]])]),
+        }
+    )
+    right.set_equivalence_class("L0.mlp", ["bert.encoder.layer.0.intermediate.dense"])
 
     combined = left + right
 
-    assert combined.names == ["left.0", "right.0", "right.1"]
-    torch.testing.assert_close(
-        combined.vectors,
-        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    assert combined.stream_names == ["model", "L0.mlp"]
+    assert combined["model"].names == ["left.0", "right.0"]
+    torch.testing.assert_close(combined["model"].vectors, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    torch.testing.assert_close(combined["L0.mlp"].vectors, torch.tensor([[5.0, 6.0]]))
+    assert combined.get_equivalence_class("L0.mlp") == {"bert.encoder.layer.0.intermediate.dense"}
+
+
+def test_multistream_add_named_routes_into_model_stream():
+    streams = MultiStreamSerialParameters([]) + NamedSerialParameters.from_vector_list(
+        ["row.0"],
+        [torch.tensor([[1.0, 2.0]])],
     )
-    assert left.names == ["left.0"]
-    assert right.names == ["right.0", "right.1"]
+
+    assert streams.stream_names == ["model"]
+    torch.testing.assert_close(streams["model"].vectors, torch.tensor([[1.0, 2.0]]))
 
 
-def test_adding_non_serial_parameters_raises_type_error():
-    params = NamedSerialParameters.from_vector_list(["row.0"], [torch.tensor([[1.0, 2.0]])])
+def test_arbitrary_stream_name_is_accepted():
+    streams = MultiStreamSerialParameters.from_stream_dict({"bad-stream": NamedSerialParameters()})
 
-    with pytest.raises(TypeError):
-        _ = params + 1
+    assert streams.stream_names == ["bad-stream"]
+
+
+def test_equivalent_model_rows_filters_model_stream_from_metadata():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["proj.head.0.0", "proj.head.0.1", "other.0"],
+                [torch.tensor([[1.0], [2.0], [3.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters(),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["proj.head.0"])
+
+    filtered = streams.equivalent_model_rows("L0.H0.qk")
+
+    assert filtered.names == ["proj.head.0.0", "proj.head.0.1"]
+
+
+def test_equivalent_model_rows_do_not_overmatch_numeric_suffixes():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["proj.head.1.0", "proj.head.10.0", "proj.head.11.0"],
+                [torch.tensor([[1.0], [2.0], [3.0]])],
+            ),
+            "L0.H1.qk": NamedSerialParameters(),
+        }
+    )
+    streams.set_equivalence_class("L0.H1.qk", ["proj.head.1"])
+
+    filtered = streams.equivalent_model_rows("L0.H1.qk")
+
+    assert filtered.names == ["proj.head.1.0"]
+
+
+def test_apply_square_matrix_updates_stream_and_matching_model_rows():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["proj.head.0.0", "proj.head.0.1", "other.0"],
+                [torch.tensor([[1.0, 0.0], [0.0, 1.0], [5.0, 6.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(
+                ["bias.0"],
+                [torch.tensor([[2.0, 3.0]])],
+            ),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["proj.head.0"])
+    matrix = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+
+    streams.apply_square_matrix(matrix, "L0.H0.qk")
+
+    torch.testing.assert_close(streams["L0.H0.qk"].vectors, torch.tensor([[3.0, 2.0]]))
+    torch.testing.assert_close(
+        streams["model"].vectors,
+        torch.tensor([[0.0, 1.0], [1.0, 0.0], [5.0, 6.0]]),
+    )
+
+
+def test_apply_square_matrix_updates_each_equivalent_prefix_block_independently():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["query.head.0.0", "query.head.0.1", "key.head.0.0", "key.head.0.1"],
+                [torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(
+                ["query.bias", "key.bias"],
+                [torch.tensor([[5.0, 6.0], [7.0, 8.0]])],
+            ),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["query.head.0", "key.head.0"])
+    matrix = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+
+    streams.apply_square_matrix(matrix, "L0.H0.qk")
+
+    torch.testing.assert_close(streams["L0.H0.qk"].vectors, torch.tensor([[6.0, 5.0], [8.0, 7.0]]))
+    torch.testing.assert_close(
+        streams["model"].vectors,
+        torch.tensor([[2.0, 20.0], [1.0, 10.0], [4.0, 40.0], [3.0, 30.0]]),
+    )
+
+
+def test_apply_square_matrix_rejects_prefixes_with_unexpected_row_counts():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["proj.head.0.0", "proj.head.0.1", "proj.head.0.2"],
+                [torch.tensor([[1.0], [2.0], [3.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(
+                ["bias.0"],
+                [torch.tensor([[2.0, 3.0]])],
+            ),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["proj.head.0"])
+
+    with pytest.raises(ValueError, match="matched 3 model rows, expected 2"):
+        streams.apply_square_matrix(torch.eye(2), "L0.H0.qk")
+
+
+def test_apply_square_matrix_leaves_model_stream_self_contained():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["row.0", "row.1"],
+                [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+            )
+        }
+    )
+    matrix = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+
+    streams.apply_square_matrix(matrix, "model")
+
+    torch.testing.assert_close(streams["model"].vectors, torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
+
+
+def test_unsupported_additions_and_invalid_value_types_are_rejected():
+    assert MultiStreamSerialParameters([]).__add__(object()) is NotImplemented
+    assert NamedSerialParameters().__add__(object()) is NotImplemented
+
+    streams = MultiStreamSerialParameters([])
+    with pytest.raises(ValueError, match="instance of NamedSerialParameters"):
+        streams["model"] = torch.tensor([[1.0, 2.0]])
+
+
+def test_save_and_load_round_trip(tmp_path):
+    params = NamedSerialParameters.from_vector_list(
+        ["row.0", "row.1"],
+        [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+    )
+    path = tmp_path / "params.pt"
+
+    params.save(path)
+    loaded = NamedSerialParameters.load(path)
+
+    assert loaded.names == ["row.0", "row.1"]
+    torch.testing.assert_close(loaded.vectors, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_filter_can_return_empty_and_matrix_multiplication_preserves_names():
+    params = NamedSerialParameters.from_vector_list(
+        ["row.0"],
+        [torch.tensor([[1.0, 2.0]])],
+    )
+
+    filtered = params.filter(lambda _: False)
+    right_product = params @ torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+    left_product = torch.tensor([[4.0]]) @ params
+
+    assert filtered.names == []
+    assert filtered.vectors is None
+    assert right_product.names == ["row.0"]
+    assert left_product.names == ["row.0"]
+    torch.testing.assert_close(right_product.vectors, torch.tensor([[2.0, 6.0]]))
+    torch.testing.assert_close(left_product.vectors, torch.tensor([[4.0, 8.0]]))
+
+
+def test_string_representations_include_stream_and_shape_context():
+    named = NamedSerialParameters.from_vector_list(
+        ["row.0", "row.1"],
+        [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+    )
+    streams = MultiStreamSerialParameters.from_stream_dict({"model": named})
+
+    assert "(2, 2)" in str(named)
+    assert "row.0" in str(named)
+    assert "model" in str(streams)
