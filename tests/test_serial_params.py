@@ -59,6 +59,16 @@ def test_multistream_add_merges_matching_streams():
     assert combined.get_equivalence_class("L0.mlp") == {"bert.encoder.layer.0.intermediate.dense"}
 
 
+def test_multistream_add_rejects_mismatched_equivalence_classes():
+    left = MultiStreamSerialParameters.from_stream_dict({"L0.mlp": NamedSerialParameters()})
+    right = MultiStreamSerialParameters.from_stream_dict({"L0.mlp": NamedSerialParameters()})
+    left.set_equivalence_class("L0.mlp", ["left.prefix"])
+    right.set_equivalence_class("L0.mlp", ["right.prefix"])
+
+    with pytest.raises(ValueError, match="Mismatched equivalence classes"):
+        left + right
+
+
 def test_multistream_add_named_routes_into_model_stream():
     streams = MultiStreamSerialParameters([]) + NamedSerialParameters.from_vector_list(
         ["row.0"],
@@ -109,6 +119,20 @@ def test_equivalent_model_rows_do_not_overmatch_numeric_suffixes():
     assert filtered.names == ["proj.head.1.0"]
 
 
+def test_equivalent_model_rows_returns_empty_without_prefixes_or_model_stream():
+    no_prefixes = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(["row.0"], [torch.tensor([[1.0]])]),
+            "L0.H0.qk": NamedSerialParameters(),
+        }
+    )
+    no_model = MultiStreamSerialParameters.from_stream_dict({"L0.H0.qk": NamedSerialParameters()})
+    no_model.set_equivalence_class("L0.H0.qk", ["proj.head.0"])
+
+    assert no_prefixes.equivalent_model_rows("L0.H0.qk").names == []
+    assert no_model.equivalent_model_rows("L0.H0.qk").names == []
+
+
 def test_apply_square_matrix_updates_stream_and_matching_model_rows():
     streams = MultiStreamSerialParameters.from_stream_dict(
         {
@@ -132,6 +156,37 @@ def test_apply_square_matrix_updates_stream_and_matching_model_rows():
         streams["model"].vectors,
         torch.tensor([[0.0, 1.0], [1.0, 0.0], [5.0, 6.0]]),
     )
+
+
+def test_apply_square_matrix_rejects_missing_stream():
+    streams = MultiStreamSerialParameters.from_stream_dict({"model": NamedSerialParameters()})
+
+    with pytest.raises(ValueError, match="Stream missing not found"):
+        streams.apply_square_matrix(torch.eye(2), "missing")
+
+
+def test_apply_square_matrix_is_noop_for_empty_streams():
+    streams = MultiStreamSerialParameters.from_stream_dict({"L0.H0.qk": NamedSerialParameters()})
+
+    returned = streams.apply_square_matrix(torch.eye(2), "L0.H0.qk")
+
+    assert returned is streams
+    assert streams["L0.H0.qk"].vectors is None
+
+
+def test_apply_square_matrix_updates_stream_without_model_equivalence_metadata():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(
+                ["bias.0"],
+                [torch.tensor([[2.0, 3.0]])],
+            )
+        }
+    )
+
+    streams.apply_square_matrix(torch.tensor([[0.0, 1.0], [1.0, 0.0]]), "L0.H0.qk")
+
+    torch.testing.assert_close(streams["L0.H0.qk"].vectors, torch.tensor([[3.0, 2.0]]))
 
 
 def test_apply_square_matrix_updates_each_equivalent_prefix_block_independently():
@@ -159,6 +214,28 @@ def test_apply_square_matrix_updates_each_equivalent_prefix_block_independently(
     )
 
 
+def test_apply_square_matrix_ignores_equivalence_prefixes_without_matching_rows():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                ["other.0"],
+                [torch.tensor([[5.0, 6.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(
+                ["bias.0"],
+                [torch.tensor([[2.0, 3.0]])],
+            ),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["missing.prefix"])
+    matrix = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+
+    streams.apply_square_matrix(matrix, "L0.H0.qk")
+
+    torch.testing.assert_close(streams["L0.H0.qk"].vectors, torch.tensor([[3.0, 2.0]]))
+    torch.testing.assert_close(streams["model"].vectors, torch.tensor([[5.0, 6.0]]))
+
+
 def test_apply_square_matrix_rejects_prefixes_with_unexpected_row_counts():
     streams = MultiStreamSerialParameters.from_stream_dict(
         {
@@ -178,20 +255,88 @@ def test_apply_square_matrix_rejects_prefixes_with_unexpected_row_counts():
         streams.apply_square_matrix(torch.eye(2), "L0.H0.qk")
 
 
-def test_apply_square_matrix_leaves_model_stream_self_contained():
+def test_apply_square_matrix_applies_model_stream_equivalence_rows_on_the_other_side():
     streams = MultiStreamSerialParameters.from_stream_dict(
         {
             "model": NamedSerialParameters.from_vector_list(
-                ["row.0", "row.1"],
-                [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+                ["proj.0", "proj.1", "other.bias"],
+                [torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])],
             )
         }
     )
+    streams.set_equivalence_class("model", ["proj"])
     matrix = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
 
     streams.apply_square_matrix(matrix, "model")
 
-    torch.testing.assert_close(streams["model"].vectors, torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
+    torch.testing.assert_close(streams["model"].vectors, torch.tensor([[4.0, 3.0], [2.0, 1.0], [6.0, 5.0]]))
+
+
+def test_apply_attention_head_matrix_rejects_missing_layers_and_wrong_shapes():
+    streams = MultiStreamSerialParameters.from_stream_dict({"model": NamedSerialParameters.from_vector_list(["row.0"], [torch.tensor([[1.0, 2.0]])])})
+
+    with pytest.raises(ValueError, match="No attention heads found"):
+        streams.apply_attention_head_matrix(torch.eye(1), layer_idx=0)
+
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                [
+                    "attn.self.query.weight.head.0.0",
+                    "attn.self.key.weight.head.0.0",
+                    "attn.self.value.weight.head.0.0",
+                    "attn.output.dense.weight.head.0.0",
+                ],
+                [torch.tensor([[1.0], [2.0], [3.0], [4.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(["q.bias"], [torch.tensor([[5.0]])]),
+            "L0.H0.ov": NamedSerialParameters.from_vector_list(["v.bias"], [torch.tensor([[6.0]])]),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["attn.self.query.weight.head.0", "attn.self.key.weight.head.0"])
+    streams.set_equivalence_class("L0.H0.ov", ["attn.self.value.weight.head.0", "attn.output.dense.weight.head.0"])
+
+    with pytest.raises(ValueError, match=r"Expected a \(1, 1\) matrix"):
+        streams.apply_attention_head_matrix(torch.eye(2), layer_idx=0)
+
+
+def test_apply_attention_head_matrix_updates_model_and_auxiliary_streams():
+    streams = MultiStreamSerialParameters.from_stream_dict(
+        {
+            "model": NamedSerialParameters.from_vector_list(
+                [
+                    "attn.self.query.weight.head.0.0",
+                    "attn.self.key.weight.head.0.0",
+                    "attn.self.value.weight.head.0.0",
+                    "attn.output.dense.weight.head.0.0",
+                    "attn.self.query.weight.head.1.0",
+                    "attn.self.key.weight.head.1.0",
+                    "attn.self.value.weight.head.1.0",
+                    "attn.output.dense.weight.head.1.0",
+                ],
+                [torch.tensor([[1.0], [2.0], [3.0], [4.0], [11.0], [12.0], [13.0], [14.0]])],
+            ),
+            "L0.H0.qk": NamedSerialParameters.from_vector_list(["qk.0"], [torch.tensor([[5.0]])]),
+            "L0.H0.ov": NamedSerialParameters.from_vector_list(["ov.0"], [torch.tensor([[6.0]])]),
+            "L0.H1.qk": NamedSerialParameters.from_vector_list(["qk.1"], [torch.tensor([[15.0]])]),
+            "L0.H1.ov": NamedSerialParameters.from_vector_list(["ov.1"], [torch.tensor([[16.0]])]),
+        }
+    )
+    streams.set_equivalence_class("L0.H0.qk", ["attn.self.query.weight.head.0", "attn.self.key.weight.head.0"])
+    streams.set_equivalence_class("L0.H0.ov", ["attn.self.value.weight.head.0", "attn.output.dense.weight.head.0"])
+    streams.set_equivalence_class("L0.H1.qk", ["attn.self.query.weight.head.1", "attn.self.key.weight.head.1"])
+    streams.set_equivalence_class("L0.H1.ov", ["attn.self.value.weight.head.1", "attn.output.dense.weight.head.1"])
+
+    streams.apply_attention_head_matrix(torch.tensor([[0.0, 1.0], [1.0, 0.0]]), layer_idx=0)
+
+    torch.testing.assert_close(
+        streams["model"].vectors,
+        torch.tensor([[11.0], [12.0], [13.0], [14.0], [1.0], [2.0], [3.0], [4.0]]),
+    )
+    torch.testing.assert_close(streams["L0.H0.qk"].vectors, torch.tensor([[15.0]]))
+    torch.testing.assert_close(streams["L0.H0.ov"].vectors, torch.tensor([[16.0]]))
+    torch.testing.assert_close(streams["L0.H1.qk"].vectors, torch.tensor([[5.0]]))
+    torch.testing.assert_close(streams["L0.H1.ov"].vectors, torch.tensor([[6.0]]))
 
 
 def test_unsupported_additions_and_invalid_value_types_are_rejected():
@@ -233,6 +378,43 @@ def test_filter_can_return_empty_and_matrix_multiplication_preserves_names():
     assert left_product.names == ["row.0"]
     torch.testing.assert_close(right_product.vectors, torch.tensor([[2.0, 6.0]]))
     torch.testing.assert_close(left_product.vectors, torch.tensor([[4.0, 8.0]]))
+
+
+def test_named_serial_parameters_item_access_and_assignment_cover_all_key_types():
+    params = NamedSerialParameters.from_vector_list(
+        ["row.0", "row.1"],
+        [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+    )
+
+    torch.testing.assert_close(params["row.0"], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(params[1], torch.tensor([3.0, 4.0]))
+    torch.testing.assert_close(params[:1], torch.tensor([[1.0, 2.0]]))
+
+    params["row.0"] = torch.tensor([9.0, 8.0])
+    params[1] = torch.tensor([7.0, 6.0])
+    params[:1] = torch.tensor([[5.0, 4.0]])
+
+    torch.testing.assert_close(params.vectors, torch.tensor([[5.0, 4.0], [7.0, 6.0]]))
+
+    with pytest.raises(TypeError, match="Key must be a string, integer, or slice"):
+        _ = params[1.5]
+    with pytest.raises(TypeError, match="Key must be a string, integer, or slice"):
+        params[1.5] = torch.tensor([0.0, 0.0])
+
+
+def test_named_serial_parameters_inplace_matrix_products_update_vectors():
+    params = NamedSerialParameters.from_vector_list(
+        ["row.0", "row.1"],
+        [torch.tensor([[1.0, 2.0], [3.0, 4.0]])],
+    )
+
+    right_result = params.inplace_right_matmul(torch.tensor([[2.0, 0.0], [0.0, 3.0]]))
+    torch.testing.assert_close(params.vectors, torch.tensor([[2.0, 4.0], [9.0, 12.0]]))
+    assert right_result is params
+
+    left_result = params.inplace_left_matmul(torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
+    torch.testing.assert_close(params.vectors, torch.tensor([[4.0, 2.0], [12.0, 9.0]]))
+    assert left_result is params
 
 
 def test_string_representations_include_stream_and_shape_context():

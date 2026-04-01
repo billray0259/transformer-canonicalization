@@ -73,6 +73,41 @@ def clone_multistream(serialized):
     )
 
 
+def permutation_matrix(size, device):
+    return torch.eye(size, device=device)[torch.randperm(size, device=device)]
+
+
+def apply_multibert_permutation_family(permuted, source_model, mode, device):
+    if mode == "model":
+        permuted.apply_square_matrix(permutation_matrix(permuted["model"].vectors.shape[1], device), "model")
+        return
+    for layer_idx in range(source_model.config.num_hidden_layers):
+        if mode == "qk":
+            for head_idx in range(source_model.config.num_attention_heads):
+                permuted.apply_square_matrix(
+                    permutation_matrix(permuted[f"L{layer_idx}.H{head_idx}.qk"].vectors.shape[1], device),
+                    f"L{layer_idx}.H{head_idx}.qk",
+                )
+        elif mode == "ov":
+            for head_idx in range(source_model.config.num_attention_heads):
+                permuted.apply_square_matrix(
+                    permutation_matrix(permuted[f"L{layer_idx}.H{head_idx}.ov"].vectors.shape[1], device),
+                    f"L{layer_idx}.H{head_idx}.ov",
+                )
+        elif mode == "head":
+            permuted.apply_attention_head_matrix(
+                permutation_matrix(source_model.config.num_attention_heads, device),
+                layer_idx,
+            )
+        elif mode == "mlp":
+            permuted.apply_square_matrix(
+                permutation_matrix(permuted[f"L{layer_idx}.mlp"].vectors.shape[1], device),
+                f"L{layer_idx}.mlp",
+            )
+        else:
+            raise ValueError(f"Unknown permutation mode: {mode}")
+
+
 def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_config):
     dummy_model = BertForMaskedLM(tiny_config)
 
@@ -162,8 +197,10 @@ def test_serialize_merges_tied_decoder_aux_rows_into_model_stream(tiny_serial_mo
 
     assert has_tied_input_output_embeddings(tiny_serial_model)
     assert "decoder" not in serialized
+    assert f"cls.predictions.transform.dense.weight.{tiny_serial_model.config.hidden_size - 1}" in serialized["model"].names
     assert "cls.predictions.transform.dense.bias" in serialized["model"].names
     assert "cls.predictions.transform.LayerNorm.weight" in serialized["model"].names
+    assert serialized.get_equivalence_class("model") == {"cls.predictions.transform.dense.weight"}
     assert all(not name.startswith("cls.predictions.decoder.weight") for name in serialized["model"].names)
     assert serialized["vocab"].names == ["cls.predictions.decoder.bias"]
 
@@ -175,7 +212,9 @@ def test_serialize_keeps_decoder_stream_when_embeddings_are_untied(tiny_serial_m
 
     assert not has_tied_input_output_embeddings(tiny_serial_model)
     assert "decoder" in serialized
+    assert f"cls.predictions.transform.dense.weight.{tiny_serial_model.config.hidden_size - 1}" in serialized["decoder"].names
     assert "cls.predictions.transform.dense.bias" in serialized["decoder"].names
+    assert all(not name.startswith("cls.predictions.transform.dense.weight") for name in serialized["model"].names)
     assert f"cls.predictions.decoder.weight.{tiny_serial_model.config.vocab_size - 1}" in serialized["decoder"].names
 
 
@@ -358,10 +397,21 @@ def test_load_serialized_backprops_to_multistream_vectors(monkeypatch, tiny_seri
     assert sum(torch.count_nonzero(grad).item() for grad in grads) > 0
 
 
-def test_multibert_permutation_equivalence_classes_preserve_outputs():
+@pytest.mark.parametrize(
+    ("mode", "atol", "rtol"),
+    [
+        ("model", 5e-5, 1e-4),
+        ("qk", 5e-5, 1e-4),
+        ("ov", 5e-5, 1e-4),
+        ("head", 5e-5, 1e-4),
+        ("mlp", 2e-4, 2e-4),
+    ],
+)
+def test_multibert_permutation_equivalence_classes_preserve_outputs(mode, atol, rtol):
     model_name = "google/multiberts-seed_0"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        source_model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
+        source_model = SerialAutoModelForMaskedLM.from_pretrained(model_name).to(device)
     except Exception as exc:
         pytest.skip(f"Hugging Face model assets unavailable: {exc}")
 
@@ -370,19 +420,12 @@ def test_multibert_permutation_equivalence_classes_preserve_outputs():
     permuted = clone_multistream(serialized)
 
     torch.manual_seed(0)
-    for layer_idx in range(source_model.config.num_hidden_layers):
-        head_permutation = torch.eye(source_model.config.num_attention_heads)[
-            torch.randperm(source_model.config.num_attention_heads)
-        ]
-        permuted.apply_attention_head_matrix(head_permutation, layer_idx)
-        mlp_permutation = torch.eye(permuted[f"L{layer_idx}.mlp"].vectors.shape[1])[
-            torch.randperm(permuted[f"L{layer_idx}.mlp"].vectors.shape[1])
-        ]
-        permuted.apply_square_matrix(mlp_permutation, f"L{layer_idx}.mlp")
+    apply_multibert_permutation_family(permuted, source_model, mode, device)
 
     permuted_model, overrides = SerialAutoModelForMaskedLM.load_serialized(permuted, model_name)
-    input_ids = torch.randint(0, source_model.config.vocab_size, (2, 8))
-    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0, 0]])
+    permuted_model = permuted_model.to(device)
+    input_ids = torch.randint(0, source_model.config.vocab_size, (2, 8), device=device)
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0, 0]], device=device)
 
     with torch.no_grad():
         source_logits = source_model(input_ids=input_ids, attention_mask=attention_mask).logits
@@ -393,5 +436,5 @@ def test_multibert_permutation_equivalence_classes_preserve_outputs():
             {"input_ids": input_ids, "attention_mask": attention_mask},
         ).logits
 
-    torch.testing.assert_close(permuted_logits, source_logits, atol=5e-5, rtol=1e-4)
+    torch.testing.assert_close(permuted_logits, source_logits, atol=atol, rtol=rtol)
 

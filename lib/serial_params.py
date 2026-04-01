@@ -71,10 +71,15 @@ class MultiStreamSerialParameters(dict):
         if stream_name not in self:
             raise ValueError(f"Stream {stream_name} not found.")
 
+        if self[stream_name].vectors is None:
+            return self
+
+        matrix = matrix.to(device=self[stream_name].vectors.device, dtype=self[stream_name].vectors.dtype)
+
         self[stream_name] = self[stream_name] @ matrix
 
         prefixes = self.get_equivalence_class(stream_name)
-        if stream_name == "model" or not prefixes or "model" not in self:
+        if not prefixes or "model" not in self:
             return self
 
         model_vectors = self["model"].vectors

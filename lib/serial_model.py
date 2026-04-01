@@ -209,7 +209,7 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         """Serialize the masked-language-model head."""
         params = self.cls.predictions
         serialized = MultiStreamSerialParameters(["model", "decoder", "vocab"])
-        serialized["model"] += self.serialize_matrix(
+        serialized["decoder"] += self.serialize_matrix(
             params.transform.dense.weight,
             name=f"{name}.transform.dense.weight",
         )
@@ -229,6 +229,10 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
         if self.cls.predictions.decoder.weight.data_ptr() == self.base_model.embeddings.word_embeddings.weight.data_ptr():
             if "decoder" in serialized.stream_names:
                 serialized["model"] += serialized["decoder"].filter(lambda name: "decoder.weight" not in name)
+                serialized.set_equivalence_class(
+                    "model",
+                    [*serialized.get_equivalence_class("model"), "cls.predictions.transform.dense.weight"],
+                )
                 del serialized["decoder"]
         return serialized
 
@@ -330,7 +334,7 @@ class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
     ) -> None:
         params = model.cls.predictions
         aux_stream = "model" if tie_embeddings else "decoder"
-        overrides.matrix(f"{name}.transform.dense.weight", params.transform.dense.out_features)
+        overrides.matrix(f"{name}.transform.dense.weight", params.transform.dense.out_features, stream=aux_stream)
         overrides.bias(f"{name}.transform.dense.bias", stream=aux_stream)
         if overrides.optional_layernorm(f"{name}.transform.LayerNorm", stream=aux_stream) is None:
             params.transform.LayerNorm = None
