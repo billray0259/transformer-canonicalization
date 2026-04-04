@@ -54,3 +54,16 @@ def masked_token_pseudo_perplexity(model, tokenizer, texts, overrides=None):
 
     assert losses, "Expected at least one non-special token to evaluate."
     return math.exp(sum(losses) / len(losses))
+
+
+def sinkhorn(log_alpha: torch.Tensor, n_iters: int = 20) -> torch.Tensor:
+    """Approximate a doubly stochastic matrix with Sinkhorn iterations."""
+    log_transport = log_alpha
+    for _ in range(n_iters):
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=-1, keepdim=True
+        )
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=-2, keepdim=True
+        )
+    return log_transport.exp()

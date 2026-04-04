@@ -18,6 +18,9 @@ SERIAL_METHOD_NAMES = (
     "serialize_encoder",
     "serialize_mlm_head",
     "serialize",
+    "load_serialized",
+    "has_tied_input_output_embeddings",
+    "untie_input_output_embeddings",
 )
 
 
@@ -26,6 +29,25 @@ def attach_serial_methods(model):
         method = getattr(SerialAutoModelForMaskedLM, method_name)
         setattr(model, method_name, MethodType(method, model))
     return model
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-expensive",
+        action="store_true",
+        default=False,
+        help="run tests marked expensive",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-expensive"):
+        return
+
+    skip_expensive = pytest.mark.skip(reason="need --run-expensive option to run")
+    for item in items:
+        if "expensive" in item.keywords:
+            item.add_marker(skip_expensive)
 
 
 @pytest.fixture

@@ -11,3 +11,4 @@ params.txt
 *.egg-info/
 wandb/
 streams.txt
+symmetries.txt

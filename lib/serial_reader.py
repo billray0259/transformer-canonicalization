@@ -1,6 +1,6 @@
 import torch
 
-from lib.serial_params import MultiStreamSerialParameters, NamedSerialParameters
+from lib.serial_params import Symmeters, NamedSerialParameters
 
 
 
@@ -9,13 +9,13 @@ class SerializedParameterReader:
 
     def __init__(
         self,
-        serialized_params: NamedSerialParameters | MultiStreamSerialParameters,
-        stream_name: str | None = None,
+        serialized_params: NamedSerialParameters | Symmeters,
+        symmetry_name: str | None = None,
     ) -> None:
-        """Initialize the reader over one serialized parameter stream."""
-        if isinstance(serialized_params, MultiStreamSerialParameters):
-            assert stream_name is not None, "A stream name is required for multistream serialized parameters."
-            serialized_params = serialized_params.get(stream_name, NamedSerialParameters())
+        """Initialize the reader over one serialized parameter symmetry."""
+        if isinstance(serialized_params, Symmeters):
+            assert symmetry_name is not None, "A symmetry name is required for Symmeters inputs."
+            serialized_params = serialized_params.get(symmetry_name, NamedSerialParameters())
         self.names = serialized_params.names
         self.vectors = serialized_params.vectors
         if self.vectors is None:
@@ -78,26 +78,26 @@ class SerializedParameterReader:
         return self.take_optional_layernorm(prefix)
 
     def assert_done(self) -> None:
-        """Assert that the entire serialized stream has been consumed."""
+        """Assert that the entire serialized symmetry has been consumed."""
         assert self.index == len(self.names), f"Unused serialized rows remain starting at {self.peek()}."
 
 
-class MultiStreamSerializedParameterReader:
-    """Lazily exposes per-stream readers over multistream serialized parameters."""
+class SymmetersReader:
+    """Lazily exposes per-symmetry readers over Symmeters."""
 
-    def __init__(self, serialized_params: NamedSerialParameters | MultiStreamSerialParameters) -> None:
+    def __init__(self, serialized_params: NamedSerialParameters | Symmeters) -> None:
         if isinstance(serialized_params, NamedSerialParameters):
-            serialized_params = MultiStreamSerialParameters.from_stream_dict({"model": serialized_params})
-        self.serialized_params = serialized_params
+            serialized_params = Symmeters.from_symmetry_dict({"model": serialized_params})
+        self.symmeters = serialized_params
         self.readers = {
-            stream_name: SerializedParameterReader(serialized_params, stream_name)
-            for stream_name in serialized_params.stream_names
+            symmetry_name: SerializedParameterReader(serialized_params, symmetry_name)
+            for symmetry_name in serialized_params.symmetry_names
         }
 
-    def __getitem__(self, stream_name: str) -> SerializedParameterReader:
-        if stream_name not in self.readers:
-            self.readers[stream_name] = SerializedParameterReader(self.serialized_params, stream_name)
-        return self.readers[stream_name]
+    def __getitem__(self, symmetry_name: str) -> SerializedParameterReader:
+        if symmetry_name not in self.readers:
+            self.readers[symmetry_name] = SerializedParameterReader(self.symmeters, symmetry_name)
+        return self.readers[symmetry_name]
 
     def assert_done(self) -> None:
         for reader in self.readers.values():
@@ -105,27 +105,27 @@ class MultiStreamSerializedParameterReader:
 
 
 class SerializedParameterOverrides(dict):
-    """Collects functional_call overrides while reading from serialized parameter streams."""
+    """Collects functional_call overrides while reading serialized parameter symmetries."""
 
-    def __init__(self, serialized_params: NamedSerialParameters | MultiStreamSerialParameters) -> None:
+    def __init__(self, serialized_params: NamedSerialParameters | Symmeters) -> None:
         super().__init__()
-        self.readers = MultiStreamSerializedParameterReader(serialized_params)
+        self.readers = SymmetersReader(serialized_params)
 
-    def has_prefix(self, prefix: str, stream: str | None = None) -> bool:
-        if stream is not None:
-            return self.readers[stream].has_prefix(prefix)
-        return any(self.readers[stream_name].has_prefix(prefix) for stream_name in self.readers.serialized_params.stream_names)
+    def has_prefix(self, prefix: str, symmetry: str | None = None) -> bool:
+        if symmetry is not None:
+            return self.readers[symmetry].has_prefix(prefix)
+        return any(self.readers[symmetry_name].has_prefix(prefix) for symmetry_name in self.readers.symmeters.symmetry_names)
 
     def matrix(
         self,
         key: str,
         row_count: int,
         *,
-        stream: str = "model",
+        symmetry: str = "model",
         src: str | None = None,
         transpose: bool = False,
     ) -> torch.Tensor:
-        value = self.readers[stream].read_matrix(src or key, row_count)
+        value = self.readers[symmetry].read_matrix(src or key, row_count)
         self[key] = value.T if transpose else value
         return self[key]
 
@@ -135,30 +135,30 @@ class SerializedParameterOverrides(dict):
         *,
         num_heads: int,
         head_dim: int,
-        stream: str = "model",
+        symmetry: str = "model",
         src: str | None = None,
         transpose: bool = False,
     ) -> torch.Tensor:
-        value = self.readers[stream].read_head_matrix(src or key, num_heads, head_dim)
+        value = self.readers[symmetry].read_head_matrix(src or key, num_heads, head_dim)
         self[key] = value.T if transpose else value
         return self[key]
 
-    def bias(self, key: str, *, stream: str = "model", src: str | None = None) -> torch.Tensor:
-        self[key] = self.readers[stream].read_bias(src or key.removesuffix(".bias"))
+    def bias(self, key: str, *, symmetry: str = "model", src: str | None = None) -> torch.Tensor:
+        self[key] = self.readers[symmetry].read_bias(src or key.removesuffix(".bias"))
         return self[key]
 
     def head_bias(
         self,
         key: str,
         *,
-        stream_names: list[str],
+        symmetry_names: list[str],
         src: str | None = None,
     ) -> torch.Tensor:
         prefix = src or key.removesuffix(".bias")
         self[key] = torch.cat(
             [
-                self.readers[stream_name].read_head_bias(prefix, head_idx)
-                for head_idx, stream_name in enumerate(stream_names)
+                self.readers[symmetry_name].read_head_bias(prefix, head_idx)
+                for head_idx, symmetry_name in enumerate(symmetry_names)
             ]
         )
         return self[key]
@@ -167,10 +167,10 @@ class SerializedParameterOverrides(dict):
         self,
         key_prefix: str,
         *,
-        stream: str = "model",
+        symmetry: str = "model",
         src: str | None = None,
     ) -> torch.Tensor | None:
-        rows = self.readers[stream].read_optional_layernorm(src or key_prefix)
+        rows = self.readers[symmetry].read_optional_layernorm(src or key_prefix)
         if rows is None:
             return None
         self[f"{key_prefix}.weight"] = rows[0]
