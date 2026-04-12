@@ -23,28 +23,9 @@ ROTATION_MSE_ATOL = 1e-8
 ROTATION_MSE_PATIENCE = 3
 
 
-def attention_dual_roles(symmetry_name):
-    return CascadingTemplateCanonicalizer.attention_dual_roles(symmetry_name)
-
-
-def attention_dual_evidence(symmeters, symmetry_name):
-    return {
-        role: tensor.detach().float().to(device)
-        for role, tensor in CascadingTemplateCanonicalizer.attention_dual_evidence(symmeters, symmetry_name).items()
-    }
-
-
-def combine_attention_dual_evidence(symmetry_name, evidence):
-    roles = attention_dual_roles(symmetry_name)
-    cat_dim = 1 if evidence[roles[0]].ndim == 3 else 0
-    return torch.cat([evidence[role] for role in roles], dim=cat_dim)
-
-
 def symmetry_evidence(symmeters, symmetry_name):
     if symmetry_name.endswith(".head"):
         return head_descriptor(symmeters, symmetry_name).detach().float().to(device)
-    if symmetry_name.endswith((".qk", ".ov")):
-        return combine_attention_dual_evidence(symmetry_name, attention_dual_evidence(symmeters, symmetry_name))
     return Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().float().to(device)
 
 
@@ -72,17 +53,8 @@ def summarize_alignment(symmetry_name, raw_symmeters, aligned_symmeters):
 
 def infer_transform(symmeters, symmetry_name, template):
     if symmetry_name.endswith(".head"):
-        template = {
-            kind: {role: tensor.to(device=device) for role, tensor in template[kind].items()}
-            for kind in ("qk", "ov")
-        }
+        template = {kind: tensor.to(device=device) for kind, tensor in template.items()}
         return head_permutation_align(template, head_evidence(symmeters, symmetry_name))[0]
-
-    if symmetry_name.endswith((".qk", ".ov")):
-        roles = attention_dual_roles(symmetry_name)
-        template = {role: tensor.to(device=device) for role, tensor in template.items()}
-        evidence = attention_dual_evidence(symmeters, symmetry_name)
-        return CascadingTemplateCanonicalizer.polar_align(template[roles[0]], evidence[roles[0]])
 
     template = template.to(device=device)
     evidence = Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().float().to(device)
@@ -92,8 +64,6 @@ def infer_transform(symmeters, symmetry_name, template):
 def apply_symmetry_transform(symmeters, symmetry_name, matrix):
     if symmetry_name.endswith(".head"):
         symmeters.apply_head_transport(symmetry_name, matrix)
-    elif symmetry_name.endswith((".qk", ".ov")):
-        symmeters.apply_attention_dual_transform(symmetry_name, matrix)
     else:
         symmeters.apply_transform(symmetry_name, matrix)
 
@@ -101,8 +71,6 @@ def apply_symmetry_transform(symmeters, symmetry_name, matrix):
 def fit_symmetry(
     symmetry_name,
     evidence_list,
-    align_fn,
-    apply_fn,
     n_iters=50,
     tol=1e-6,
     stop_mode="delta",
@@ -110,32 +78,44 @@ def fit_symmetry(
     mse_atol=ROTATION_MSE_ATOL,
     mse_patience=ROTATION_MSE_PATIENCE,
 ):
-    aligned = torch.stack(evidence_list).clone()
-    sample = evidence_list[0]
+    evidence = torch.stack(evidence_list)  # (N, K, D) or (N, H, K, D)
+    N, D = evidence.shape[0], evidence.shape[-1]
+    aligned = evidence.clone()
     previous_mse = None
     stagnant_steps = 0
 
-    if sample.ndim == 2:
-        dim = sample.shape[-1]
-        transforms = [torch.eye(dim, device=aligned.device) for _ in evidence_list]
+    if evidence.ndim == 3:
+        transforms = torch.eye(D, device=evidence.device).expand(N, D, D).clone()
     else:
-        num_heads, dim = sample.shape[0], sample.shape[-1]
-        transforms = [
-            torch.eye(dim, device=aligned.device).expand(num_heads, dim, dim).clone()
-            for _ in evidence_list
-        ]
+        H = evidence.shape[1]
+        transforms = torch.eye(D, device=evidence.device).expand(N, H, D, D).clone()
+
+    # Precompute upper-triangle mask for pairwise MSE
+    tri_mask = torch.triu(torch.ones(N, N, device=evidence.device, dtype=torch.bool), diagonal=1)
 
     progress = tqdm(range(n_iters), desc=f"fit {symmetry_name}", leave=False)
     for _ in progress:
         mean = aligned.mean(dim=0)
-        max_delta = 0.0
-        for i, evidence in enumerate(evidence_list):
-            new_transform = align_fn(mean, evidence)
-            aligned[i] = apply_fn(evidence, new_transform)
-            max_delta = max(max_delta, (new_transform - transforms[i]).norm().item())
-            transforms[i] = new_transform
 
-        mse = pairwise_mse_values([aligned[i] for i in range(aligned.shape[0])]).mean()
+        # Batched Procrustes: all N models in one SVD call
+        new_transforms = procrustes_align(mean, evidence)
+
+        # Batched apply
+        if evidence.ndim == 3:
+            aligned = evidence @ new_transforms
+        else:
+            aligned = torch.einsum("nhkd,nhde->nhke", evidence, new_transforms)
+
+        max_delta = (new_transforms - transforms).flatten(1).norm(dim=1).max().item()
+        transforms = new_transforms
+
+        # Vectorized pairwise MSE
+        flat = aligned.flatten(1)
+        sq_norms = flat.pow(2).mean(-1)
+        dots = (flat @ flat.T) / flat.shape[-1]
+        mse_matrix = sq_norms[:, None] + sq_norms[None, :] - 2 * dots
+        mse = mse_matrix[tri_mask].mean().item()
+
         mse_change = float("nan") if previous_mse is None else abs(mse - previous_mse)
         progress.set_postfix(train_mse=f"{mse:.6f}", mse_change=f"{mse_change:.3e}", delta=f"{max_delta:.3e}")
 
@@ -153,85 +133,13 @@ def fit_symmetry(
             break
 
     progress.close()
-    return transforms, aligned.mean(dim=0)
-
-
-def fit_attention_dual_symmetry(
-    symmetry_name,
-    evidence_list,
-    n_iters=50,
-    tol=1e-6,
-    stop_mode="delta",
-    mse_rtol=ROTATION_MSE_RTOL,
-    mse_atol=ROTATION_MSE_ATOL,
-    mse_patience=ROTATION_MSE_PATIENCE,
-):
-    roles = attention_dual_roles(symmetry_name)
-    aligned = {
-        role: torch.stack([evidence[role] for evidence in evidence_list]).clone()
-        for role in roles
-    }
-    sample = evidence_list[0][roles[0]]
-    previous_mse = None
-    stagnant_steps = 0
-
-    if sample.ndim == 2:
-        dim = sample.shape[-1]
-        transforms = [torch.eye(dim, device=sample.device) for _ in evidence_list]
-    else:
-        num_heads, dim = sample.shape[0], sample.shape[-1]
-        transforms = [
-            torch.eye(dim, device=sample.device).expand(num_heads, dim, dim).clone()
-            for _ in evidence_list
-        ]
-
-    progress = tqdm(range(n_iters), desc=f"fit {symmetry_name}", leave=False)
-    for _ in progress:
-        mean = {role: aligned[role].mean(dim=0) for role in roles}
-        max_delta = 0.0
-        for i, evidence in enumerate(evidence_list):
-            new_transform = CascadingTemplateCanonicalizer.polar_align(mean[roles[0]], evidence[roles[0]])
-            aligned_evidence = CascadingTemplateCanonicalizer.apply_attention_dual_evidence_transform(
-                evidence,
-                new_transform,
-                symmetry_name,
-            )
-            for role in roles:
-                aligned[role][i] = aligned_evidence[role]
-            max_delta = max(max_delta, (new_transform - transforms[i]).norm().item())
-            transforms[i] = new_transform
-
-        mse = pairwise_mse_values([
-            combine_attention_dual_evidence(
-                symmetry_name,
-                {role: aligned[role][i] for role in roles},
-            )
-            for i in range(aligned[roles[0]].shape[0])
-        ]).mean()
-        mse_change = float("nan") if previous_mse is None else abs(mse - previous_mse)
-        progress.set_postfix(train_mse=f"{mse:.6f}", mse_change=f"{mse_change:.3e}", delta=f"{max_delta:.3e}")
-
-        if stop_mode == "mse":
-            if previous_mse is not None and np.isclose(mse, previous_mse, rtol=mse_rtol, atol=mse_atol):
-                stagnant_steps += 1
-            else:
-                stagnant_steps = 0
-            previous_mse = mse
-            if stagnant_steps >= mse_patience:
-                break
-            continue
-
-        if max_delta < tol:
-            break
-
-    progress.close()
-    return transforms, {role: aligned[role].mean(dim=0) for role in roles}
+    return list(transforms), aligned.mean(dim=0)
 
 
 def head_evidence(symmeters, symmetry_name):
     prefix = symmetry_name.rsplit(".", 1)[0]
     return {
-        kind: attention_dual_evidence(symmeters, f"{prefix}.{kind}")
+        kind: Canonicalizer._evidence_tensor(symmeters, f"{prefix}.{kind}").detach().float().to(device)
         for kind in ("qk", "ov")
     }
 
@@ -241,45 +149,26 @@ def apply_head_permutation(evidence, matrix):
 
 
 def head_permutation_align(target, source):
-    num_heads = source["qk"]["query"].shape[0]
-    costs = torch.empty((num_heads, num_heads), device=source["qk"]["query"].device)
-    for target_head in range(num_heads):
-        for source_head in range(num_heads):
-            cost = 0.0
-            for kind in ("qk", "ov"):
-                symmetry = f"L0.{kind}"
-                roles = attention_dual_roles(symmetry)
-                matrix = procrustes_align(
-                    target[kind][roles[0]][target_head],
-                    source[kind][roles[0]][source_head],
-                )
-                aligned = CascadingTemplateCanonicalizer.apply_attention_dual_evidence_transform(
-                    {
-                        role: source[kind][role][source_head]
-                        for role in roles
-                    },
-                    matrix,
-                    symmetry,
-                )
-                for role in roles:
-                    cost += (aligned[role] - target[kind][role][target_head]).pow(2).mean()
-            costs[target_head, source_head] = cost
-    _, col_ind = linear_sum_assignment(costs.detach().cpu().numpy())
-    permutation = torch.eye(num_heads, device=source["qk"]["query"].device)[col_ind]
-    mean_cost = costs[torch.arange(num_heads, device=costs.device), torch.as_tensor(col_ind, device=costs.device)].mean().item()
+    num_heads = source["qk"].shape[0]
+    total_cost = torch.zeros((num_heads, num_heads), device=source["qk"].device)
+    for kind in ("qk", "ov"):
+        t, s = target[kind], source[kind]  # (H, K, D)
+        K, D = t.shape[-2], t.shape[-1]
+        M = torch.einsum("jkd,ike->ijde", s, t)  # (H, H, D, D)
+        S = torch.linalg.svdvals(M.flatten(0, 1)).unflatten(0, (num_heads, num_heads))
+        total_cost += (t.pow(2).sum((-2, -1))[:, None] + s.pow(2).sum((-2, -1))[None, :] - 2 * S.sum(-1)) / (K * D)
+    _, col_ind = linear_sum_assignment(total_cost.detach().cpu().numpy())
+    permutation = torch.eye(num_heads, device=source["qk"].device)[col_ind]
+    mean_cost = total_cost[torch.arange(num_heads, device=total_cost.device), torch.as_tensor(col_ind, device=total_cost.device)].mean().item()
     return permutation, mean_cost
 
 
 def fit_head_symmetry(symmetry_name, evidence_list, n_iters=30, tol=1e-6):
-    num_heads = evidence_list[0]["qk"]["query"].shape[0]
+    num_heads = evidence_list[0]["qk"].shape[0]
     permutations = [torch.eye(num_heads, device=device) for _ in evidence_list]
-    template = {
-        kind: {
-            role: evidence_list[0][kind][role].clone()
-            for role in attention_dual_roles(f"L0.{kind}")
-        }
-        for kind in ("qk", "ov")
-    }
+    template = {kind: evidence_list[0][kind].clone() for kind in ("qk", "ov")}
+    previous_cost = None
+    stagnant_steps = 0
 
     progress = tqdm(range(n_iters), desc=f"fit {symmetry_name}", leave=False)
     for _ in progress:
@@ -294,42 +183,21 @@ def fit_head_symmetry(symmetry_name, evidence_list, n_iters=30, tol=1e-6):
             permutations[i] = permutation
 
             for kind in ("qk", "ov"):
-                symmetry = f"L0.{kind}"
-                roles = attention_dual_roles(symmetry)
-                permuted = {
-                    role: apply_head_permutation(evidence[kind][role], permutation)
-                    for role in roles
-                }
-                aligned_heads = {role: [] for role in roles}
-                for head in range(num_heads):
-                    matrix = procrustes_align(
-                        template[kind][roles[0]][head],
-                        permuted[roles[0]][head],
-                    )
-                    aligned_head = CascadingTemplateCanonicalizer.apply_attention_dual_evidence_transform(
-                        {
-                            role_name: permuted[role_name][head]
-                            for role_name in roles
-                        },
-                        matrix,
-                        symmetry,
-                    )
-                    for role in roles:
-                        aligned_heads[role].append(aligned_head[role])
-                aligned[kind].append({
-                    role: torch.stack(aligned_heads[role])
-                    for role in roles
-                })
+                permuted = apply_head_permutation(evidence[kind], permutation)
+                rotation = procrustes_align(template[kind], permuted)  # (H, D, D) batched
+                aligned[kind].append(apply_evidence_transform(permuted, rotation))
 
-        template = {
-            kind: {
-                role: torch.stack([item[role] for item in aligned[kind]]).mean(dim=0)
-                for role in attention_dual_roles(f"L0.{kind}")
-            }
-            for kind in ("qk", "ov")
-        }
-        progress.set_postfix(cost=f"{mean_cost / len(evidence_list):.6f}", delta=f"{max_delta:.3e}")
-        if max_delta < tol:
+        template = {kind: torch.stack(aligned[kind]).mean(dim=0) for kind in ("qk", "ov")}
+        mean_cost /= len(evidence_list)
+        cost_change = float("nan") if previous_cost is None else abs(mean_cost - previous_cost)
+        progress.set_postfix(cost=f"{mean_cost:.6f}", cost_change=f"{cost_change:.3e}", delta=f"{max_delta:.3e}")
+
+        if previous_cost is not None and np.isclose(mean_cost, previous_cost, rtol=ROTATION_MSE_RTOL, atol=ROTATION_MSE_ATOL):
+            stagnant_steps += 1
+        else:
+            stagnant_steps = 0
+        previous_cost = mean_cost
+        if stagnant_steps >= ROTATION_MSE_PATIENCE:
             break
 
     progress.close()
@@ -337,7 +205,7 @@ def fit_head_symmetry(symmetry_name, evidence_list, n_iters=30, tol=1e-6):
 
 
 def procrustes_align(target, source):
-    # target/source: (K, D) or (H, K, D)
+    # Supports arbitrary leading batch dims: (..., K, D)
     M = source.transpose(-1, -2) @ target
     U, _, Vh = torch.linalg.svd(M)
     return U @ Vh
@@ -427,22 +295,7 @@ for symmetry_name in cascade_progress:
         for i, P in enumerate(Ps):
             apply_symmetry_transform(train_working[i], symmetry_name, P)
 
-        templates[symmetry_name] = {
-            kind: {role: tensor.detach().cpu() for role, tensor in template[kind].items()}
-            for kind in ("qk", "ov")
-        }
-    elif symmetry_name.endswith((".qk", ".ov")):
-        evidences = [attention_dual_evidence(sym, symmetry_name) for sym in train_working]
-        Ts, template = fit_attention_dual_symmetry(
-            symmetry_name,
-            evidences,
-            stop_mode="mse",
-        )
-
-        for i, T in enumerate(Ts):
-            apply_symmetry_transform(train_working[i], symmetry_name, T)
-
-        templates[symmetry_name] = {role: tensor.detach().cpu() for role, tensor in template.items()}
+        templates[symmetry_name] = {kind: tensor.detach().cpu() for kind, tensor in template.items()}
     else:
         evidences = [
             Canonicalizer._evidence_tensor(sym, symmetry_name).detach().float().to(device)
@@ -451,8 +304,6 @@ for symmetry_name in cascade_progress:
         Ts, template = fit_symmetry(
             symmetry_name,
             evidences,
-            procrustes_align,
-            apply_evidence_transform,
             stop_mode="mse",
         )
 

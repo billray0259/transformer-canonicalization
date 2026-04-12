@@ -134,138 +134,41 @@ class HeadAligner(nn.Module):
 
 
 class CascadingTemplateCanonicalizer(nn.Module):
-    def __init__(self, order: Sequence[str], templates: dict[str, torch.Tensor | dict[str, torch.Tensor]]):
+    def __init__(self, order: Sequence[str], templates: dict[str, torch.Tensor]):
         super().__init__()
         self.order = tuple(order)
         missing = [symmetry_name for symmetry_name in self.order if symmetry_name not in templates]
         if missing:
             raise ValueError(f"Missing templates for symmetries {missing}.")
 
-        self._buffer_names: dict[str, str | dict[str, str] | dict[str, object]] = {}
+        self._buffer_names: dict[str, str | dict[str, str]] = {}
         for symmetry_name in self.order:
-            self._buffer_names[symmetry_name] = self._register_template(symmetry_name, templates[symmetry_name])
+            template = templates[symmetry_name]
+            if isinstance(template, dict):
+                self._buffer_names[symmetry_name] = {}
+                for kind, tensor in template.items():
+                    buffer_name = f"template__{_module_key(symmetry_name)}__{kind}"
+                    self.register_buffer(buffer_name, tensor.detach().clone())
+                    self._buffer_names[symmetry_name][kind] = buffer_name
+                continue
 
-    def _register_template(self, symmetry_name: str, template, path: tuple[str, ...] = ()):
-        if isinstance(template, dict):
-            return {
-                kind: self._register_template(symmetry_name, value, (*path, kind))
-                for kind, value in template.items()
-            }
+            buffer_name = f"template__{_module_key(symmetry_name)}"
+            self.register_buffer(buffer_name, template.detach().clone())
+            self._buffer_names[symmetry_name] = buffer_name
 
-        suffix = "__".join(path)
-        buffer_name = f"template__{_module_key(symmetry_name)}"
-        if suffix:
-            buffer_name = f"{buffer_name}__{suffix}"
-        self.register_buffer(buffer_name, template.detach().clone())
-        return buffer_name
-
-    def _materialize_template(self, buffer_names):
-        if isinstance(buffer_names, dict):
-            return {
-                kind: self._materialize_template(child)
-                for kind, child in buffer_names.items()
-            }
-        return getattr(self, buffer_names)
-
-    @staticmethod
-    def _cpu_template(template):
-        if isinstance(template, dict):
-            return {kind: CascadingTemplateCanonicalizer._cpu_template(value) for kind, value in template.items()}
-        return template.detach().cpu()
-
-    def template(self, symmetry_name: str) -> torch.Tensor | dict[str, torch.Tensor]:
+    def template(self, symmetry_name: str) -> torch.Tensor:
         if symmetry_name not in self._buffer_names:
             raise KeyError(f"Unknown symmetry {symmetry_name}.")
-        return self._materialize_template(self._buffer_names[symmetry_name])
+        buffer_names = self._buffer_names[symmetry_name]
+        if isinstance(buffer_names, dict):
+            return {kind: getattr(self, buffer_name) for kind, buffer_name in buffer_names.items()}
+        return getattr(self, buffer_names)
 
     @staticmethod
     def procrustes_align(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
         matrix = source.transpose(-1, -2) @ target
         u, _, vh = torch.linalg.svd(matrix)
         return u @ vh
-
-    @staticmethod
-    def inverse_transpose(matrix: torch.Tensor) -> torch.Tensor:
-        return torch.linalg.inv(matrix).transpose(-1, -2)
-
-    @staticmethod
-    def attention_dual_roles(symmetry_name: str) -> tuple[str, str] | None:
-        if symmetry_name.endswith(".qk"):
-            return ("query", "key")
-        if symmetry_name.endswith(".ov"):
-            return ("value", "output")
-        return None
-
-    @classmethod
-    def polar_align(cls, target: torch.Tensor, source: torch.Tensor, min_singular_value: float = 1e-6) -> torch.Tensor:
-        linear_map = torch.linalg.lstsq(source, target).solution
-        u, singular_values, vh = torch.linalg.svd(linear_map)
-        rotation = u @ vh
-        stretch = vh.transpose(-1, -2) @ torch.diag_embed(singular_values.clamp_min(min_singular_value)) @ vh
-        return rotation @ stretch
-
-    @staticmethod
-    def apply_evidence_transform(evidence: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-        if evidence.ndim == 2:
-            return evidence @ matrix
-        if evidence.ndim == 3:
-            return torch.einsum("hkd,hde->hke", evidence, matrix)
-        raise ValueError(f"Unexpected evidence rank: {evidence.ndim}")
-
-    @staticmethod
-    def attention_dual_role(symmetry_name: str, component_name: str, component: ParameterComponent) -> str | None:
-        names = (component_name, *component.parameter_keys)
-        if symmetry_name.endswith(".qk"):
-            if any(".query." in name or name.startswith("query.") for name in names):
-                return "query"
-            if any(".key." in name or name.startswith("key.") for name in names):
-                return "key"
-            return None
-
-        if any(".self.value." in name or ".value." in name or name.startswith("value.") for name in names):
-            return "value"
-        if any(".output.dense.weight" in name or name.startswith("output.dense.weight") for name in names):
-            return "output"
-        return None
-
-    @classmethod
-    def attention_dual_evidence(cls, symmeters: Symmeters, symmetry_name: str) -> dict[str, torch.Tensor]:
-        roles = cls.attention_dual_roles(symmetry_name)
-        if roles is None:
-            raise ValueError(f"Symmetry {symmetry_name} is not a dual-action attention symmetry.")
-
-        bank_axis_name = symmeters.transform_bank_axis(symmetry_name)
-        cat_dim = 1 if bank_axis_name is not None else 0
-        grouped = {role: [] for role in roles}
-
-        for component_name, component in symmeters.owned_components(symmetry_name).items():
-            role = cls.attention_dual_role(symmetry_name, component_name, component)
-            if role is None:
-                continue
-            flattened = _flatten_component_for_axis(component, symmetry_name, bank_axis_name=bank_axis_name)
-            if flattened is not None:
-                grouped[role].append(flattened.float())
-
-        if any(not grouped[role] for role in roles):
-            raise ValueError(f"No dual-action evidence found for symmetry {symmetry_name}.")
-        return {role: torch.cat(grouped[role], dim=cat_dim) for role in roles}
-
-    @classmethod
-    def apply_attention_dual_evidence_transform(
-        cls,
-        evidence: dict[str, torch.Tensor],
-        matrix: torch.Tensor,
-        symmetry_name: str,
-    ) -> dict[str, torch.Tensor]:
-        roles = cls.attention_dual_roles(symmetry_name)
-        if roles is None:
-            raise ValueError(f"Symmetry {symmetry_name} is not a dual-action attention symmetry.")
-
-        dual_matrix = cls.inverse_transpose(matrix)
-        return {
-            roles[0]: cls.apply_evidence_transform(evidence[roles[0]], matrix),
-            roles[1]: cls.apply_evidence_transform(evidence[roles[1]], dual_matrix),
-        }
 
     @staticmethod
     def permutation_align(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
@@ -279,8 +182,8 @@ class CascadingTemplateCanonicalizer(nn.Module):
     def head_evidence(symmeters: Symmeters, symmetry_name: str) -> dict[str, torch.Tensor]:
         prefix = symmetry_name.rsplit(".", 1)[0]
         return {
-            "qk": CascadingTemplateCanonicalizer.attention_dual_evidence(symmeters, f"{prefix}.qk"),
-            "ov": CascadingTemplateCanonicalizer.attention_dual_evidence(symmeters, f"{prefix}.ov"),
+            kind: Canonicalizer._evidence_tensor(symmeters, f"{prefix}.{kind}").detach().float()
+            for kind in ("qk", "ov")
         }
 
     @staticmethod
@@ -291,35 +194,16 @@ class CascadingTemplateCanonicalizer(nn.Module):
     def head_permutation_align(cls, target: dict[str, torch.Tensor], source: dict[str, torch.Tensor]) -> torch.Tensor:
         from scipy.optimize import linear_sum_assignment
 
-        num_heads = source["qk"]["query"].shape[0]
-        costs = torch.empty(
-            (num_heads, num_heads),
-            device=source["qk"]["query"].device,
-            dtype=source["qk"]["query"].dtype,
-        )
-        for target_head in range(num_heads):
-            for source_head in range(num_heads):
-                cost = 0.0
-                for kind in ("qk", "ov"):
-                    symmetry = f"L0.{kind}"
-                    roles = cls.attention_dual_roles(symmetry)
-                    matrix = cls.procrustes_align(
-                        target[kind][roles[0]][target_head],
-                        source[kind][roles[0]][source_head],
-                    )
-                    aligned = cls.apply_attention_dual_evidence_transform(
-                        {
-                            role: source[kind][role][source_head]
-                            for role in roles
-                        },
-                        matrix,
-                        symmetry,
-                    )
-                    for role in roles:
-                        cost += (aligned[role] - target[kind][role][target_head]).pow(2).mean()
-                costs[target_head, source_head] = cost
-        _, col_ind = linear_sum_assignment(costs.detach().cpu().numpy())
-        return torch.eye(num_heads, device=source["qk"]["query"].device, dtype=source["qk"]["query"].dtype)[col_ind]
+        num_heads = source["qk"].shape[0]
+        total_cost = torch.zeros((num_heads, num_heads), device=source["qk"].device, dtype=source["qk"].dtype)
+        for kind in ("qk", "ov"):
+            t, s = target[kind], source[kind]
+            K, D = t.shape[-2], t.shape[-1]
+            M = torch.einsum("jkd,ike->ijde", s, t)
+            S = torch.linalg.svdvals(M.flatten(0, 1)).unflatten(0, (num_heads, num_heads))
+            total_cost += (t.pow(2).sum((-2, -1))[:, None] + s.pow(2).sum((-2, -1))[None, :] - 2 * S.sum(-1)) / (K * D)
+        _, col_ind = linear_sum_assignment(total_cost.detach().cpu().numpy())
+        return torch.eye(num_heads, device=source["qk"].device, dtype=source["qk"].dtype)[col_ind]
 
     @staticmethod
     def head_descriptor(symmeters: Symmeters, symmetry_name: str) -> torch.Tensor:
@@ -335,23 +219,11 @@ class CascadingTemplateCanonicalizer(nn.Module):
     def infer_transform(self, symmeters: Symmeters, symmetry_name: str) -> torch.Tensor:
         template = self.template(symmetry_name)
         if symmetry_name.endswith(".head"):
-            head_evidence = self.head_evidence(symmeters, symmetry_name)
             evidence = {
-                kind: {
-                    role: tensor.to(device=template[kind][role].device, dtype=template[kind][role].dtype)
-                    for role, tensor in head_evidence[kind].items()
-                }
-                for kind in ("qk", "ov")
+                kind: tensor.to(device=template[kind].device, dtype=template[kind].dtype)
+                for kind, tensor in self.head_evidence(symmeters, symmetry_name).items()
             }
             return self.head_permutation_align(template, evidence)
-
-        if symmetry_name.endswith((".qk", ".ov")):
-            roles = self.attention_dual_roles(symmetry_name)
-            evidence = {
-                role: tensor.to(device=template[role].device, dtype=template[role].dtype)
-                for role, tensor in self.attention_dual_evidence(symmeters, symmetry_name).items()
-            }
-            return self.polar_align(template[roles[0]], evidence[roles[0]])
 
         evidence = Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().to(device=template.device, dtype=template.dtype)
         return self.procrustes_align(template, evidence)
@@ -360,8 +232,6 @@ class CascadingTemplateCanonicalizer(nn.Module):
     def apply_symmetry_transform(symmeters: Symmeters, symmetry_name: str, matrix: torch.Tensor):
         if symmetry_name.endswith(".head"):
             symmeters.apply_head_transport(symmetry_name, matrix)
-        elif symmetry_name.endswith((".qk", ".ov")):
-            symmeters.apply_attention_dual_transform(symmetry_name, matrix)
         else:
             symmeters.apply_transform(symmetry_name, matrix)
         return symmeters
@@ -387,7 +257,10 @@ class CascadingTemplateCanonicalizer(nn.Module):
             {
                 "order": self.order,
                 "templates": {
-                    symmetry_name: self._cpu_template(self.template(symmetry_name))
+                    symmetry_name: {
+                        kind: tensor.detach().cpu()
+                        for kind, tensor in self.template(symmetry_name).items()
+                    } if isinstance(self.template(symmetry_name), dict) else self.template(symmetry_name).detach().cpu()
                     for symmetry_name in self.order
                 },
             },
@@ -487,10 +360,9 @@ class Canonicalizer(nn.Module):
             if module_key in self.dimension_aligners:
                 evidence = self._evidence_tensor(canonicalized, symmetry_name)
                 if evidence.ndim == 2:
-                    matrix, _ = self.dimension_aligners[module_key](evidence.unsqueeze(0), tau=tau)
-                    matrix = matrix.squeeze(0)
+                    matrix = self.dimension_aligners[module_key](evidence.unsqueeze(0), tau=tau).squeeze(0)
                 else:
-                    matrix, _ = self.dimension_aligners[module_key](evidence, tau=tau)
+                    matrix = self.dimension_aligners[module_key](evidence, tau=tau)
                 canonicalized.apply_transform(symmetry_name, matrix)
                 continue
 
