@@ -1,8 +1,10 @@
-from lib.serial_model import SerialAutoModelForMaskedLM
+from transformers import AutoModelForMaskedLM
 from tqdm import tqdm
+
+from lib.serial_model import serialize_model
 
 for seed in tqdm(range(25)):
     model_name = f"google/multiberts-seed_{seed}"
-    serial_model = SerialAutoModelForMaskedLM.from_pretrained(model_name)
-    serialize_params = serial_model.serialize()
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+    serialize_params = serialize_model(model)
     serialize_params.save(f"data/multiberts/serialized/seed_{seed}.pt")

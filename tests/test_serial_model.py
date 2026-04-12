@@ -1,28 +1,15 @@
-from types import MethodType
-
 import pytest
 import torch
 from torch.func import functional_call
 from transformers import AutoModelForMaskedLM, BertForMaskedLM
 
-from lib.serial_model import SerialAutoModelForMaskedLM
-from lib.serial_params import Symmeters, NamedSerialParameters
-from lib.serial_reader import SerializedParameterOverrides
-
-SERIAL_METHOD_NAMES = (
-    "serialize_matrix",
-    "serialize_bias",
-    "serialize_head_biases",
-    "serialize_layernorm",
-    "serialize_embeddings",
-    "serialize_attention",
-    "serialize_encoder_layer",
-    "serialize_encoder",
-    "serialize_mlm_head",
-    "serialize",
-    "load_serialized",
-    "has_tied_input_output_embeddings",
-    "untie_input_output_embeddings",
+from lib.serial_model import (
+    has_tied_input_output_embeddings,
+    load_serialized,
+    serialize_attention,
+    serialize_encoder_layer,
+    serialize_model,
+    untie_input_output_embeddings,
 )
 
 
@@ -33,245 +20,170 @@ def build_shell_model(tiny_config, seed=1234):
     return model
 
 
-def clone_symmetry(symmetry_params):
-    if symmetry_params.vectors is None:
-        return NamedSerialParameters()
-    return NamedSerialParameters.from_vector_list(
-        symmetry_params.names,
-        [symmetry_params.vectors.detach().clone().requires_grad_(True)],
-    )
-
-
 def rand_perm_matrix(size, device):
     return torch.eye(size, device=device)[torch.randperm(size, device=device)]
 
 
-def full_rand_perms(model, symmetries=None):
-    if symmetries is None:
-        symmetries = {"model", "decoder", "qk", "ov", "head", "mlp"}
-    perms = {}
-    if "model" in symmetries:
-        perms["model"] = rand_perm_matrix(model.config.hidden_size, model.base_model.encoder.layer[0].attention.self.query.weight.device)
-    if "decoder" in symmetries:
-        perms["decoder"] = rand_perm_matrix(model.config.hidden_size, model.base_model.encoder.layer[0].attention.self.query.weight.device)
-    
-    for layer_idx in range(model.config.num_hidden_layers):
-        for head_idx in range(model.config.num_attention_heads):
-            if "qk" in symmetries:
-                perms[f"L{layer_idx}.H{head_idx}.qk"] = rand_perm_matrix(model.config.hidden_size // model.config.num_attention_heads, model.base_model.encoder.layer[0].attention.self.query.weight.device)
-            if "ov" in symmetries:
-                perms[f"L{layer_idx}.H{head_idx}.ov"] = rand_perm_matrix(model.config.hidden_size // model.config.num_attention_heads, model.base_model.encoder.layer[0].attention.self.query.weight.device)
-        if "head" in symmetries:
-            perms[f"L{layer_idx}.head"] = rand_perm_matrix(model.config.num_attention_heads, model.base_model.encoder.layer[0].attention.self.query.weight.device)
-        if "mlp" in symmetries:
-            perms[f"L{layer_idx}.mlp"] = rand_perm_matrix(model.config.intermediate_size, model.base_model.encoder.layer[0].intermediate.dense.weight.device)
-    return perms
+def bank_axis_name(symmetry_name):
+    if not symmetry_name.startswith("L"):
+        return None
+    if symmetry_name.endswith(".qk") or symmetry_name.endswith(".ov"):
+        layer_name = symmetry_name.rsplit(".", 1)[0]
+        return f"{layer_name}.head"
+    return None
 
 
-def assert_multibert_permutation_preserves_outputs(symmetries, *, atol, rtol):
-    model_name = "google/multiberts-seed_0"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def count_distinct_permutations(permutations):
+    return sum(matrix.shape[0] if matrix.ndim == 3 else 1 for matrix in permutations.values())
+
+
+def full_rand_perms(symmeters):
+    permutations = {}
+    for symmetry_name in symmeters.ordered_transform_names():
+        if symmetry_name.endswith(".head"):
+            continue
+
+        component_specs = symmeters.components_with_axis(symmetry_name)
+        if not component_specs:
+            continue
+        device = component_specs[0][2].tensor.device
+
+        bank_axis = bank_axis_name(symmetry_name)
+        if bank_axis is not None:
+            bank_size = symmeters.symmetry_size(bank_axis)
+            permutations[symmetry_name] = torch.stack(
+                [rand_perm_matrix(symmeters.symmetry_size(symmetry_name), device) for _ in range(bank_size)]
+            )
+            continue
+
+        permutations[symmetry_name] = rand_perm_matrix(symmeters.symmetry_size(symmetry_name), device)
+
+    head_symmetry_names = [symmetry_name for symmetry_name in symmeters.ordered_transform_names() if symmetry_name.endswith(".head")]
+    if head_symmetry_names:
+        head_size = symmeters.symmetry_size(head_symmetry_names[0])
+        device = symmeters.components_with_axis(head_symmetry_names[0])[0][2].tensor.device
+        permutations["head"] = rand_perm_matrix(head_size, device)
+    return permutations
+
+
+def assert_pretrained_model_permutations_preserve_outputs(
+    model_name: str,
+    *,
+    untie_embeddings_first: bool,
+    atol: float,
+    rtol: float,
+):
+    device = torch.device("cuda")
     try:
-        source_model = SerialAutoModelForMaskedLM.from_pretrained(model_name).to(device)
+        source_model = AutoModelForMaskedLM.from_pretrained(model_name, local_files_only=True).to(device)
     except Exception as exc:
-        pytest.skip(f"Hugging Face model assets unavailable: {exc}")
-
-    source_model.untie_input_output_embeddings()
+        pytest.skip(f"Hugging Face model assets unavailable locally: {exc}")
 
     source_model.eval()
-    source_symmeters = source_model.serialize()
+    if untie_embeddings_first:
+        untie_input_output_embeddings(source_model)
+
+    source_symmeters = serialize_model(source_model)
     permuted_symmeters = source_symmeters.clone()
 
     torch.manual_seed(0)
-    print("generating random permutations...")
-    permutations = full_rand_perms(source_model, symmetries=symmetries)
-    print("applying permutations to serialized parameters...")
-    permuted_symmeters.apply_square_matrices(source_model, permutations)
-    print("loading permuted model...")
-    permuted_model, overrides = SerialAutoModelForMaskedLM.load_serialized(permuted_symmeters, model_name)
-    permuted_model = permuted_model.to(device)
-    input_ids = torch.randint(0, source_model.config.vocab_size, (2, 8), device=device)
-    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0, 0]], device=device)
-    print("running source and permuted models...")
+    permutations = full_rand_perms(permuted_symmeters)
+
+    explicit_symmetry_names = {
+        *[
+            symmetry_name
+            for symmetry_name in permuted_symmeters.ordered_transform_names()
+            if not symmetry_name.endswith(".head")
+        ],
+        *( ["head"] if any(symmetry_name.endswith(".head") for symmetry_name in permuted_symmeters.ordered_transform_names()) else [] ),
+    }
+    assert set(permutations) == explicit_symmetry_names
+
+    expected_distinct_permutations = (
+        1
+        + int("decoder" in permuted_symmeters)
+        + source_model.config.num_hidden_layers * source_model.config.num_attention_heads
+        + source_model.config.num_hidden_layers * source_model.config.num_attention_heads
+        + source_model.config.num_hidden_layers
+        + int(any(symmetry_name.endswith(".head") for symmetry_name in permuted_symmeters.ordered_transform_names()))
+    )
+    assert count_distinct_permutations(permutations) == expected_distinct_permutations
+
+    permuted_symmeters.apply_transforms(permutations)
+
+    loaded_model, overrides = load_serialized(
+        permuted_symmeters,
+        model_name,
+        local_files_only=True,
+    )
+    loaded_model = loaded_model.to(device).eval()
+
+    input_ids = torch.tensor(
+        [
+            [101, 1996, 4937, 2938, 2006, 1996, 13523, 102],
+            [101, 2023, 3231, 8667, 23651, 2594, 8043, 102],
+        ],
+        device=device,
+    )
+    attention_mask = torch.ones_like(input_ids, device=device)
+
     with torch.no_grad():
         source_logits = source_model(input_ids=input_ids, attention_mask=attention_mask).logits
         permuted_logits = functional_call(
-            permuted_model,
+            loaded_model,
             overrides,
             (),
             {"input_ids": input_ids, "attention_mask": attention_mask},
         ).logits
 
-    assert permuted_model.has_tied_input_output_embeddings() is source_model.has_tied_input_output_embeddings()
     torch.testing.assert_close(permuted_logits, source_logits, atol=atol, rtol=rtol)
 
 
-def test_from_pretrained_attaches_bound_serialization_methods(monkeypatch, tiny_config):
-    dummy_model = BertForMaskedLM(tiny_config)
+def test_serialize_attention_uses_layer_level_head_stacked_components(tiny_model):
+    attention = tiny_model.base_model.encoder.layer[0].attention
+    symmeters = serialize_attention(tiny_model, attention, layer_idx=0, name="attn")
 
-    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        assert pretrained_model_name_or_path == "dummy-model"
-        assert model_args == ()
-        assert kwargs == {}
-        return dummy_model
-
-    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
-
-    loaded_model = SerialAutoModelForMaskedLM.from_pretrained("dummy-model")
-
-    assert loaded_model is dummy_model
-    for method_name in SERIAL_METHOD_NAMES:
-        method = getattr(loaded_model, method_name)
-        assert callable(method)
-        assert isinstance(method, MethodType)
-        assert method.__self__ is dummy_model
+    assert symmeters.symmetry_names == ["model", "L0.qk", "L0.ov", "L0.head"]
+    assert "L0.H0.qk" not in symmeters
+    assert symmeters.component("L0.qk", "attn.self.query.weight").axes == ("L0.head", "L0.qk", "model")
+    assert tuple(symmeters.tensor("L0.qk", "attn.self.query.weight").shape) == (2, 2, 4)
+    assert tuple(symmeters.tensor("L0.qk", "attn.self.query.bias").shape) == (2, 2)
+    assert tuple(symmeters.tensor("L0.ov", "attn.output.dense.weight").shape) == (2, 2, 4)
 
 
-def test_serialize_attention_routes_weights_and_biases_into_expected_symmetries(tiny_serial_model):
-    attention = tiny_serial_model.base_model.encoder.layer[0].attention
+def test_serialize_encoder_layer_keeps_mlp_bias_as_owned_block(tiny_model):
+    layer = tiny_model.base_model.encoder.layer[0]
+    symmeters = serialize_encoder_layer(tiny_model, layer, layer_idx=0, name="encoder.layer.0")
 
-    symmeters = tiny_serial_model.serialize_attention(attention, layer_idx=0, name="attn")
-
-    assert symmeters.symmetry_names == [
-        "model",
-        "L0.H0.qk",
-        "L0.H1.qk",
-        "L0.H0.ov",
-        "L0.H1.ov",
-    ]
-    assert symmeters["L0.H0.qk"].names == ["attn.self.query.head.0.bias", "attn.self.key.head.0.bias"]
-    assert symmeters["L0.H1.qk"].names == ["attn.self.query.head.1.bias", "attn.self.key.head.1.bias"]
-    assert symmeters["L0.H0.ov"].names == ["attn.self.value.head.0.bias"]
-    assert symmeters["L0.H1.ov"].names == ["attn.self.value.head.1.bias"]
-    assert symmeters.get_equivalence_class("L0.H0.qk") == {
-        "attn.self.query.weight.head.0",
-        "attn.self.key.weight.head.0",
-    }
-    assert symmeters.get_equivalence_class("L0.H0.ov") == {
-        "attn.self.value.weight.head.0",
-        "attn.output.dense.weight.head.0",
-    }
-    assert "attn.output.dense.bias" in symmeters["model"].names
-    torch.testing.assert_close(symmeters["model"].vectors[0], attention.self.query.weight[0])
-    torch.testing.assert_close(symmeters["L0.H0.qk"].vectors[0], attention.self.query.bias[:2])
-    torch.testing.assert_close(symmeters["L0.H1.qk"].vectors[0], attention.self.query.bias[2:])
-    torch.testing.assert_close(symmeters["L0.H0.ov"].vectors[0], attention.self.value.bias[:2])
-    torch.testing.assert_close(symmeters["L0.H1.ov"].vectors[0], attention.self.value.bias[2:])
+    assert "encoder.layer.0.intermediate.dense.bias" in symmeters["L0.mlp"]
+    assert symmeters.component("L0.mlp", "encoder.layer.0.intermediate.dense.bias").axes == ("L0.mlp",)
+    assert "encoder.layer.0.output.dense.bias" in symmeters["model"]
 
 
-def test_serialize_encoder_layer_routes_mlp_bias_to_layer_stream(tiny_serial_model):
-    layer = tiny_serial_model.base_model.encoder.layer[0]
+def test_serialize_model_tracks_tied_and_untied_decoder_blocks(tiny_model):
+    tied_symmeters = serialize_model(tiny_model)
 
-    symmeters = tiny_serial_model.serialize_encoder_layer(layer, layer_idx=0, name="encoder.layer.0")
+    assert has_tied_input_output_embeddings(tiny_model)
+    assert "decoder" not in tied_symmeters
+    assert tied_symmeters.component("model", "cls.predictions.transform.dense.weight").axes == ("model", "model")
+    assert not tied_symmeters.has_component("cls.predictions.decoder.weight")
 
-    assert symmeters["L0.mlp"].names == ["encoder.layer.0.intermediate.dense.bias"]
-    assert symmeters.get_equivalence_class("L0.mlp") == {
-        "encoder.layer.0.intermediate.dense",
-        "encoder.layer.0.output.dense.weight",
-    }
-    torch.testing.assert_close(symmeters["L0.mlp"].vectors[0], layer.intermediate.dense.bias)
-    assert "encoder.layer.0.output.dense.bias" in symmeters["model"].names
+    untie_input_output_embeddings(tiny_model)
+    untied_symmeters = serialize_model(tiny_model)
 
-
-def test_equivalent_model_rows_return_same_class_weight_rows(tiny_serial_model):
-    symmeters = tiny_serial_model.serialize_attention(
-        tiny_serial_model.base_model.encoder.layer[0].attention,
-        layer_idx=0,
-        name="attn",
-    )
-
-    equivalent_rows = symmeters.equivalent_model_rows("L0.H1.qk")
-
-    assert equivalent_rows.names == [
-        "attn.self.query.weight.head.1.0",
-        "attn.self.query.weight.head.1.1",
-        "attn.self.key.weight.head.1.0",
-        "attn.self.key.weight.head.1.1",
-    ]
-
-
-def test_serialize_merges_tied_decoder_aux_rows_into_model_stream(tiny_serial_model):
-    symmeters = tiny_serial_model.serialize()
-
-    assert tiny_serial_model.has_tied_input_output_embeddings() is True
-    assert "decoder" not in symmeters
-    assert f"cls.predictions.transform.dense.weight.{tiny_serial_model.config.hidden_size - 1}" in symmeters["model"].names
-    assert "cls.predictions.transform.dense.bias" in symmeters["model"].names
-    assert "cls.predictions.transform.LayerNorm.weight" in symmeters["model"].names
-    assert symmeters.get_equivalence_class("model") == {"cls.predictions.transform.dense.weight"}
-    assert all(not name.startswith("cls.predictions.decoder.weight") for name in symmeters["model"].names)
-    assert symmeters["vocab"].names == ["cls.predictions.decoder.bias"]
-
-
-def test_serialize_keeps_decoder_symmetry_when_embeddings_are_untied(tiny_serial_model):
-    tiny_serial_model.untie_input_output_embeddings()
-
-    symmeters = tiny_serial_model.serialize()
-
-    assert not tiny_serial_model.has_tied_input_output_embeddings()
-    assert "decoder" in symmeters
-    assert symmeters.get_equivalence_class("decoder") == {"cls.predictions.transform.dense.weight"}
-    assert f"cls.predictions.transform.dense.weight.{tiny_serial_model.config.hidden_size - 1}" in symmeters["decoder"].names
-    assert "cls.predictions.transform.dense.bias" in symmeters["decoder"].names
-    assert all(not name.startswith("cls.predictions.transform.dense.weight") for name in symmeters["model"].names)
-    assert f"cls.predictions.decoder.weight.{tiny_serial_model.config.vocab_size - 1}" in symmeters["decoder"].names
-
-
-def test_serialize_helpers_cover_default_and_custom_naming_paths(tiny_serial_model):
-    tiny_serial_model.base_model.embeddings.LayerNorm = None
-    tiny_serial_model.base_model.encoder.layer[0].output.LayerNorm = None
-
-    embeddings = tiny_serial_model.serialize_embeddings(name="custom.embeddings")
-    attention = tiny_serial_model.serialize_attention(tiny_serial_model.base_model.encoder.layer[0].attention, layer_idx=0)
-    encoder_layer = tiny_serial_model.serialize_encoder_layer(tiny_serial_model.base_model.encoder.layer[0], layer_idx=0)
-    encoder = tiny_serial_model.serialize_encoder(name="custom.encoder")
-
-    assert all(not name.startswith("custom.embeddings.LayerNorm") for name in embeddings.names)
-    assert attention["model"].names[0].startswith("bert.encoder.layer.0.attention.self.query.weight")
-    assert "bert.encoder.layer.0.output.dense.bias" in encoder_layer["model"].names
-    assert "custom.encoder.layer.0.intermediate.dense.0" in encoder["model"].names
-
-
-def test_deserialize_helpers_accept_custom_prefixes(tiny_serial_model, tiny_config):
-    shell_model = build_shell_model(tiny_config, seed=999)
-
-    embedding_overrides = SerializedParameterOverrides(
-        Symmeters.from_symmetry_dict(
-            {"model": tiny_serial_model.serialize_embeddings(name="custom.embeddings")}
-        )
-    )
-    encoder_overrides = SerializedParameterOverrides(tiny_serial_model.serialize_encoder(name="custom.encoder"))
-
-    SerialAutoModelForMaskedLM._deserialize_embeddings(shell_model, embedding_overrides, name="custom.embeddings")
-    SerialAutoModelForMaskedLM._deserialize_encoder(shell_model, encoder_overrides, name="custom.encoder")
-
-    embedding_overrides.assert_done()
-    encoder_overrides.assert_done()
-
-
-def test_serialize_handles_tied_models_even_when_decoder_stream_is_absent(monkeypatch, tiny_serial_model):
-    def fake_serialize_mlm_head(self, name="cls.predictions"):
-        return Symmeters.from_symmetry_dict(
-            {
-                "model": NamedSerialParameters(),
-                "vocab": NamedSerialParameters(),
-            }
-        )
-
-    monkeypatch.setattr(tiny_serial_model, "serialize_mlm_head", MethodType(fake_serialize_mlm_head, tiny_serial_model))
-
-    symmeters = tiny_serial_model.serialize()
-
-    assert "decoder" not in symmeters
+    assert not has_tied_input_output_embeddings(tiny_model)
+    assert "decoder" in untied_symmeters
+    assert untied_symmeters.component("decoder", "cls.predictions.transform.dense.weight").axes == ("decoder", "model")
+    assert untied_symmeters.component("decoder", "cls.predictions.decoder.weight").axes == ("vocab_items", "decoder")
 
 
 @pytest.mark.parametrize("tied_embeddings", [True, False])
-def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_serial_model, tiny_config, tied_embeddings):
-    source_model = tiny_serial_model
+def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_model, tiny_config, tied_embeddings):
+    source_model = tiny_model
     if not tied_embeddings:
-        source_model.untie_input_output_embeddings()
+        untie_input_output_embeddings(source_model)
 
-    serialized_symmeters = source_model.serialize()
+    serialized_symmeters = serialize_model(source_model)
     shell_model = build_shell_model(tiny_config, seed=4321)
     input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
     attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
@@ -284,7 +196,7 @@ def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_serial_m
 
     monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
 
-    loaded_model, overrides = SerialAutoModelForMaskedLM.load_serialized(serialized_symmeters, "dummy-model")
+    loaded_model, overrides = load_serialized(serialized_symmeters, "dummy-model")
     loaded_outputs = functional_call(
         loaded_model,
         overrides,
@@ -294,17 +206,17 @@ def test_load_serialized_matches_source_model_outputs(monkeypatch, tiny_serial_m
     source_outputs = source_model(input_ids=input_ids, attention_mask=attention_mask)
 
     assert loaded_model is shell_model
-    assert loaded_model.has_tied_input_output_embeddings() is tied_embeddings
+    assert has_tied_input_output_embeddings(loaded_model) is tied_embeddings
     torch.testing.assert_close(loaded_outputs.logits, source_outputs.logits)
 
 
-def test_serialize_and_load_handle_missing_optional_layernorms(monkeypatch, tiny_serial_model, tiny_config):
-    tiny_serial_model.base_model.embeddings.LayerNorm = None
-    tiny_serial_model.base_model.encoder.layer[0].attention.output.LayerNorm = None
-    tiny_serial_model.base_model.encoder.layer[1].output.LayerNorm = None
-    tiny_serial_model.cls.predictions.transform.LayerNorm = None
+def test_serialize_and_load_handle_missing_optional_layernorms(monkeypatch, tiny_model, tiny_config):
+    tiny_model.base_model.embeddings.LayerNorm = None
+    tiny_model.base_model.encoder.layer[0].attention.output.LayerNorm = None
+    tiny_model.base_model.encoder.layer[1].output.LayerNorm = None
+    tiny_model.cls.predictions.transform.LayerNorm = None
 
-    serialized_symmeters = tiny_serial_model.serialize()
+    serialized_symmeters = serialize_model(tiny_model)
     shell_model = build_shell_model(tiny_config)
 
     def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -313,7 +225,7 @@ def test_serialize_and_load_handle_missing_optional_layernorms(monkeypatch, tiny
 
     monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
 
-    loaded_model, overrides = SerialAutoModelForMaskedLM.load_serialized(serialized_symmeters, "dummy-model")
+    loaded_model, overrides = load_serialized(serialized_symmeters, "dummy-model")
 
     assert loaded_model.base_model.embeddings.LayerNorm is None
     assert loaded_model.base_model.encoder.layer[0].attention.output.LayerNorm is None
@@ -325,53 +237,14 @@ def test_serialize_and_load_handle_missing_optional_layernorms(monkeypatch, tiny
     assert "cls.predictions.transform.LayerNorm.weight" not in overrides
 
 
-def test_load_serialized_rejects_unexpected_row_names(monkeypatch, tiny_serial_model, tiny_config):
-    serialized_symmeters = tiny_serial_model.serialize()
-    broken_symmeters = Symmeters.from_symmetry_dict(
-        {
-            **serialized_symmeters,
-            "model": NamedSerialParameters.from_vector_list(
-                ["wrong.prefix", *serialized_symmeters["model"].names[1:]],
-                [serialized_symmeters["model"].vectors],
-            ),
-        }
-    )
-    shell_model = build_shell_model(tiny_config)
-
-    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        assert pretrained_model_name_or_path == "dummy-model"
-        return shell_model
-
-    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
-
-    with pytest.raises(AssertionError, match="Expected rows"):
-        SerialAutoModelForMaskedLM.load_serialized(broken_symmeters, "dummy-model")
-
-
-def test_load_serialized_rejects_flat_named_serialized_params(monkeypatch, tiny_serial_model, tiny_config):
-    flat_serialized = NamedSerialParameters()
-    symmeters = tiny_serial_model.serialize()
-    for symmetry_name in symmeters.symmetry_names:
-        flat_serialized += symmeters[symmetry_name]
-
-    shell_model = build_shell_model(tiny_config)
-
-    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        assert pretrained_model_name_or_path == "dummy-model"
-        return shell_model
-
-    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
-
+def test_load_serialized_rejects_non_symmeters():
     with pytest.raises(TypeError, match="Symmeters"):
-        SerialAutoModelForMaskedLM.load_serialized(flat_serialized, "dummy-model")
+        load_serialized({}, "dummy-model")
 
 
-def test_load_serialized_backprops_to_symmeters_vectors(monkeypatch, tiny_serial_model, tiny_config):
-    tiny_serial_model.untie_input_output_embeddings()
-    serialized_symmeters = tiny_serial_model.serialize()
-    differentiable_symmeters = Symmeters.from_symmetry_dict(
-        {symmetry_name: clone_symmetry(symmetry_params) for symmetry_name, symmetry_params in serialized_symmeters.items()}
-    )
+def test_load_serialized_backprops_to_component_tensors(monkeypatch, tiny_model, tiny_config):
+    untie_input_output_embeddings(tiny_model)
+    differentiable_symmeters = serialize_model(tiny_model).clone()
     shell_model = build_shell_model(tiny_config, seed=5678)
     input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
 
@@ -381,7 +254,7 @@ def test_load_serialized_backprops_to_symmeters_vectors(monkeypatch, tiny_serial
 
     monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
 
-    functional_model, overrides = SerialAutoModelForMaskedLM.load_serialized(
+    functional_model, overrides = load_serialized(
         differentiable_symmeters,
         "dummy-model",
     )
@@ -389,35 +262,71 @@ def test_load_serialized_backprops_to_symmeters_vectors(monkeypatch, tiny_serial
     loss.backward()
 
     grads = [
-        symmetry_params.vectors.grad
-        for symmetry_params in differentiable_symmeters.values()
-        if symmetry_params.vectors is not None and symmetry_params.vectors.grad is not None
+        component.tensor.grad
+        for _, _, component in differentiable_symmeters.iter_components()
+        if component.tensor.grad is not None
     ]
     assert grads
     assert sum(torch.count_nonzero(grad).item() for grad in grads) > 0
 
 
-@pytest.mark.parametrize(
-    ("symmetries", "atol", "rtol"),
-    [
-        ({"model"}, 5e-5, 1e-4),
-        ({"decoder"}, 5e-5, 1e-4),
-        ({"qk"}, 5e-5, 1e-4),
-        ({"ov"}, 5e-5, 1e-4),
-        ({"head"}, 5e-5, 1e-4),
-        ({"mlp"}, 2e-4, 2e-4),
-    ],
-    ids=["model", "decoder", "qk", "ov", "head", "mlp"],
-)
-@pytest.mark.expensive
-def test_multibert_permutation_equivalence_classes_preserve_outputs(symmetries, atol, rtol):
-    assert_multibert_permutation_preserves_outputs(symmetries, atol=atol, rtol=rtol)
+@pytest.mark.parametrize("tied_embeddings", [True, False])
+def test_apply_transforms_preserve_outputs(monkeypatch, tiny_model, tiny_config, tied_embeddings):
+    source_model = tiny_model
+    if not tied_embeddings:
+        untie_input_output_embeddings(source_model)
 
-def test_multibert_composed_permutation_preserves_outputs_with_untied_decoder():
-    assert_multibert_permutation_preserves_outputs(
-        {"model", "decoder", "qk", "ov", "head", "mlp"},
+    source_model.eval()
+    source_symmeters = serialize_model(source_model)
+    permuted_symmeters = source_symmeters.clone()
+
+    torch.manual_seed(0)
+    permuted_symmeters.apply_transforms(full_rand_perms(permuted_symmeters))
+
+    shell_model = build_shell_model(tiny_config, seed=999)
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        assert pretrained_model_name_or_path == "dummy-model"
+        return shell_model
+
+    monkeypatch.setattr(AutoModelForMaskedLM, "from_pretrained", classmethod(fake_from_pretrained))
+
+    loaded_model, overrides = load_serialized(permuted_symmeters, "dummy-model")
+    input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    with torch.no_grad():
+        source_logits = source_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        permuted_logits = functional_call(
+            loaded_model,
+            overrides,
+            (),
+            {"input_ids": input_ids, "attention_mask": attention_mask},
+        ).logits
+
+    torch.testing.assert_close(permuted_logits, source_logits, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.expensive
+def test_full_bert_randomly_permuting_every_symmetry_preserves_outputs():
+    assert_pretrained_model_permutations_preserve_outputs(
+        "bert-base-uncased",
+        untie_embeddings_first=True,
         atol=2e-4,
         rtol=2e-4,
     )
+
+
+@pytest.mark.expensive
+def test_full_bert_random_permutation_count_is_303():
+    try:
+        model = AutoModelForMaskedLM.from_pretrained("bert-base-uncased", local_files_only=True)
+    except Exception as exc:
+        pytest.skip(f"Hugging Face model assets unavailable locally: {exc}")
+
+    untie_input_output_embeddings(model)
+    permutations = full_rand_perms(serialize_model(model))
+
+    assert count_distinct_permutations(permutations) == 303
 
 

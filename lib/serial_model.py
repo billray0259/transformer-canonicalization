@@ -1,384 +1,398 @@
-from types import MethodType
+from __future__ import annotations
+
 from typing import Any
 
 import torch
 from transformers import AutoModelForMaskedLM
 
-from lib.serial_params import NamedSerialParameters, Symmeters
-from lib.serial_reader import SerializedParameterOverrides
+from lib.serial_params import Symmeters
 
 
-class SerialAutoModelForMaskedLM(AutoModelForMaskedLM):
-    """Adds serialization and differentiable deserialization helpers to MLM models."""
+def has_tied_input_output_embeddings(model: Any) -> bool:
+    return (
+        model.base_model.embeddings.word_embeddings.weight.data_ptr()
+        == model.cls.predictions.decoder.weight.data_ptr()
+    )
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        *model_args: Any,
-        **kwargs: Any,
-    ) -> "SerialAutoModelForMaskedLM":
-        """Load a pretrained MLM and bind the serialization helpers to the concrete instance."""
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        for method_name in [
-            "serialize_matrix",
-            "serialize_bias",
-            "serialize_head_biases",
-            "serialize_layernorm",
-            "serialize_embeddings",
-            "serialize_attention",
-            "serialize_encoder_layer",
-            "serialize_encoder",
-            "serialize_mlm_head",
-            "serialize",
-            "load_serialized",
-            "has_tied_input_output_embeddings",
-            "untie_input_output_embeddings",
-        ]:
-            setattr(model, method_name, MethodType(getattr(cls, method_name), model))
-        return model
 
-    def serialize_matrix(
-        self,
-        matrix: torch.Tensor,
-        name: str = "matrix",
-        names: list[str] | None = None,
-    ) -> NamedSerialParameters:
-        """Serialize a matrix as row vectors."""
-        assert matrix.shape[1] == self.config.hidden_size, "Matrix must have the same number of columns as the model's hidden size."
-        if names is None:
-            names = [f"{name}.{i}" for i in range(matrix.shape[0])]
-        return NamedSerialParameters.from_vector_list(names, [matrix])
+def untie_input_output_embeddings(model: Any):
+    model.cls.predictions.decoder.weight = torch.nn.Parameter(
+        model.cls.predictions.decoder.weight.detach().clone()
+    )
+    return model
 
-    def serialize_bias(self, bias: torch.Tensor, name: str | None = None) -> NamedSerialParameters:
-        """Serialize a bias vector as a single row."""
-        return NamedSerialParameters.from_vector_list(
-            [f"{name}.bias" if name is not None else "bias"],
-            [bias.unsqueeze(0)],
+
+def _stack_head_rows(matrix: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    if matrix.shape[0] != num_heads * head_dim:
+        raise ValueError("Matrix row count must split evenly across attention heads.")
+    return matrix.reshape(num_heads, head_dim, matrix.shape[1])
+
+
+def _stack_head_bias(bias: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    if bias.shape[0] != num_heads * head_dim:
+        raise ValueError("Bias length must split evenly across attention heads.")
+    return bias.reshape(num_heads, head_dim)
+
+
+def _serialize_layernorm(layernorm: torch.nn.LayerNorm) -> torch.Tensor:
+    return torch.stack([layernorm.weight, layernorm.bias])
+
+
+def serialize_embeddings(model: Any, name: str | None = None) -> Symmeters:
+    prefix = name or f"{model.base_model_prefix}.embeddings"
+    params = model.base_model.embeddings
+    symmeters = Symmeters(["model"])
+    symmeters.add_component(
+        "model",
+        f"{prefix}.word_embeddings.weight",
+        params.word_embeddings.weight,
+        axes=("vocab_items", "model"),
+        kind="weight",
+        layout="identity",
+        parameter_keys=f"{prefix}.word_embeddings.weight",
+    )
+    symmeters.add_component(
+        "model",
+        f"{prefix}.position_embeddings.weight",
+        params.position_embeddings.weight,
+        axes=("position_items", "model"),
+        kind="weight",
+        layout="identity",
+        parameter_keys=f"{prefix}.position_embeddings.weight",
+    )
+    symmeters.add_component(
+        "model",
+        f"{prefix}.token_type_embeddings.weight",
+        params.token_type_embeddings.weight,
+        axes=("token_type_items", "model"),
+        kind="weight",
+        layout="identity",
+        parameter_keys=f"{prefix}.token_type_embeddings.weight",
+    )
+    if params.LayerNorm is not None:
+        symmeters.add_component(
+            "model",
+            f"{prefix}.LayerNorm",
+            _serialize_layernorm(params.LayerNorm),
+            axes=("layernorm_param", "model"),
+            kind="layernorm",
+            layout="layernorm",
+            parameter_keys=(f"{prefix}.LayerNorm.weight", f"{prefix}.LayerNorm.bias"),
+        )
+    return symmeters
+
+
+def serialize_attention(
+    model: Any,
+    attention: Any,
+    layer_idx: int,
+    name: str | None = None,
+) -> Symmeters:
+    prefix = name or f"{model.base_model_prefix}.encoder.layer.{layer_idx}.attention"
+    num_heads = attention.self.num_attention_heads
+    head_dim = attention.self.attention_head_size
+    head_symmetry = f"L{layer_idx}.head"
+    qk_symmetry = f"L{layer_idx}.qk"
+    ov_symmetry = f"L{layer_idx}.ov"
+
+    symmeters = Symmeters(["model", qk_symmetry, ov_symmetry, head_symmetry])
+
+    for projection_name in ("query", "key"):
+        projection = getattr(attention.self, projection_name)
+        component_name = f"{prefix}.self.{projection_name}.weight"
+        symmeters.add_component(
+            qk_symmetry,
+            component_name,
+            _stack_head_rows(projection.weight, num_heads, head_dim),
+            axes=(head_symmetry, qk_symmetry, "model"),
+            kind="weight",
+            layout="head_rows",
+            parameter_keys=component_name,
+        )
+        component_name = f"{prefix}.self.{projection_name}.bias"
+        symmeters.add_component(
+            qk_symmetry,
+            component_name,
+            _stack_head_bias(projection.bias, num_heads, head_dim),
+            axes=(head_symmetry, qk_symmetry),
+            kind="bias",
+            layout="head_bias",
+            parameter_keys=component_name,
         )
 
-    def serialize_head_biases(
-        self,
-        bias: torch.Tensor,
-        *,
-        num_heads: int,
-        head_dim: int,
-        name: str,
-    ) -> NamedSerialParameters:
-        """Serialize a bias vector as one row per attention head."""
-        assert bias.shape[0] == num_heads * head_dim, "Bias must split evenly across attention heads."
-        return NamedSerialParameters.from_vector_list(
-            [f"{name}.head.{head_idx}.bias" for head_idx in range(num_heads)],
-            [bias.reshape(num_heads, head_dim)],
+    value = attention.self.value
+    component_name = f"{prefix}.self.value.weight"
+    symmeters.add_component(
+        ov_symmetry,
+        component_name,
+        _stack_head_rows(value.weight, num_heads, head_dim),
+        axes=(head_symmetry, ov_symmetry, "model"),
+        kind="weight",
+        layout="head_rows",
+        parameter_keys=component_name,
+    )
+    component_name = f"{prefix}.self.value.bias"
+    symmeters.add_component(
+        ov_symmetry,
+        component_name,
+        _stack_head_bias(value.bias, num_heads, head_dim),
+        axes=(head_symmetry, ov_symmetry),
+        kind="bias",
+        layout="head_bias",
+        parameter_keys=component_name,
+    )
+
+    component_name = f"{prefix}.output.dense.weight"
+    symmeters.add_component(
+        ov_symmetry,
+        component_name,
+        _stack_head_rows(attention.output.dense.weight.T, num_heads, head_dim),
+        axes=(head_symmetry, ov_symmetry, "model"),
+        kind="weight",
+        layout="head_rows_transposed",
+        parameter_keys=component_name,
+    )
+    component_name = f"{prefix}.output.dense.bias"
+    symmeters.add_component(
+        "model",
+        component_name,
+        attention.output.dense.bias,
+        axes=("model",),
+        kind="bias",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    if attention.output.LayerNorm is not None:
+        symmeters.add_component(
+            "model",
+            f"{prefix}.output.LayerNorm",
+            _serialize_layernorm(attention.output.LayerNorm),
+            axes=("layernorm_param", "model"),
+            kind="layernorm",
+            layout="layernorm",
+            parameter_keys=(f"{prefix}.output.LayerNorm.weight", f"{prefix}.output.LayerNorm.bias"),
         )
 
-    def serialize_layernorm(self, layernorm: torch.nn.LayerNorm, name: str = "LayerNorm") -> NamedSerialParameters:
-        """Serialize a LayerNorm module as separate weight and bias rows."""
-        return NamedSerialParameters.from_vector_list(
-            [f"{name}.weight", f"{name}.bias"],
-            [layernorm.weight.unsqueeze(0), layernorm.bias.unsqueeze(0)],
+    return symmeters
+
+
+def serialize_encoder_layer(
+    model: Any,
+    layer: Any,
+    layer_idx: int,
+    name: str | None = None,
+) -> Symmeters:
+    prefix = name or f"{model.base_model_prefix}.encoder.layer.{layer_idx}"
+    symmeters = serialize_attention(model, layer.attention, layer_idx=layer_idx, name=f"{prefix}.attention")
+    mlp_symmetry = f"L{layer_idx}.mlp"
+    symmeters.add_symmetry(mlp_symmetry)
+
+    component_name = f"{prefix}.intermediate.dense.weight"
+    symmeters.add_component(
+        mlp_symmetry,
+        component_name,
+        layer.intermediate.dense.weight,
+        axes=(mlp_symmetry, "model"),
+        kind="weight",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    component_name = f"{prefix}.intermediate.dense.bias"
+    symmeters.add_component(
+        mlp_symmetry,
+        component_name,
+        layer.intermediate.dense.bias,
+        axes=(mlp_symmetry,),
+        kind="bias",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    component_name = f"{prefix}.output.dense.weight"
+    symmeters.add_component(
+        mlp_symmetry,
+        component_name,
+        layer.output.dense.weight.T,
+        axes=(mlp_symmetry, "model"),
+        kind="weight",
+        layout="transpose",
+        parameter_keys=component_name,
+    )
+    component_name = f"{prefix}.output.dense.bias"
+    symmeters.add_component(
+        "model",
+        component_name,
+        layer.output.dense.bias,
+        axes=("model",),
+        kind="bias",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    if layer.output.LayerNorm is not None:
+        symmeters.add_component(
+            "model",
+            f"{prefix}.output.LayerNorm",
+            _serialize_layernorm(layer.output.LayerNorm),
+            axes=("layernorm_param", "model"),
+            kind="layernorm",
+            layout="layernorm",
+            parameter_keys=(f"{prefix}.output.LayerNorm.weight", f"{prefix}.output.LayerNorm.bias"),
         )
+    return symmeters
 
-    def serialize_embeddings(self, name: str | None = None) -> NamedSerialParameters:
-        """Serialize the embedding tables and optional embedding LayerNorm."""
-        if name is None:
-            name = f"{self.base_model_prefix}.embeddings"
-        params = self.base_model.embeddings
-        serialized = NamedSerialParameters()
-        serialized += self.serialize_matrix(params.word_embeddings.weight, name=f"{name}.word_embeddings.weight")
-        serialized += self.serialize_matrix(params.position_embeddings.weight, name=f"{name}.position_embeddings.weight")
-        serialized += self.serialize_matrix(params.token_type_embeddings.weight, name=f"{name}.token_type_embeddings.weight")
-        if params.LayerNorm is not None:
-            serialized += self.serialize_layernorm(params.LayerNorm, name=f"{name}.LayerNorm")
-        return serialized
 
-    def serialize_attention(
-        self,
-        attention: Any,
-        layer_idx: int,
-        name: str | None = None,
-    ) -> Symmeters:
-        """Serialize one attention block using the head-indexed row naming scheme."""
-        if name is None:
-            name = f"{self.base_model_prefix}.encoder.layer.{layer_idx}.attention"
-        num_heads = attention.self.num_attention_heads
-        head_dim = attention.self.attention_head_size
-        qk_symmetry_names = [f"L{layer_idx}.H{head_idx}.qk" for head_idx in range(num_heads)]
-        ov_symmetry_names = [f"L{layer_idx}.H{head_idx}.ov" for head_idx in range(num_heads)]
-        symmeters = Symmeters(
-            [
-                "model",
-                *qk_symmetry_names,
-                *ov_symmetry_names,
-            ]
+def serialize_encoder(model: Any, name: str | None = None) -> Symmeters:
+    prefix = name or f"{model.base_model_prefix}.encoder"
+    symmeters = Symmeters([])
+    for layer_idx, layer in enumerate(model.base_model.encoder.layer):
+        symmeters += serialize_encoder_layer(model, layer, layer_idx=layer_idx, name=f"{prefix}.layer.{layer_idx}")
+    return symmeters
+
+
+def serialize_mlm_head(model: Any, name: str = "cls.predictions") -> Symmeters:
+    params = model.cls.predictions
+    tied = has_tied_input_output_embeddings(model)
+    owner = "model" if tied else "decoder"
+    transform_axes = ("model", "model") if tied else ("decoder", "model")
+
+    symmeters = Symmeters(["model", "vocab"])
+    if not tied:
+        symmeters.add_symmetry("decoder")
+
+    component_name = f"{name}.transform.dense.weight"
+    symmeters.add_component(
+        owner,
+        component_name,
+        params.transform.dense.weight,
+        axes=transform_axes,
+        kind="weight",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    component_name = f"{name}.transform.dense.bias"
+    symmeters.add_component(
+        owner,
+        component_name,
+        params.transform.dense.bias,
+        axes=(owner,),
+        kind="bias",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    if params.transform.LayerNorm is not None:
+        symmeters.add_component(
+            owner,
+            f"{name}.transform.LayerNorm",
+            _serialize_layernorm(params.transform.LayerNorm),
+            axes=("layernorm_param", owner),
+            kind="layernorm",
+            layout="layernorm",
+            parameter_keys=(f"{name}.transform.LayerNorm.weight", f"{name}.transform.LayerNorm.bias"),
         )
-
-        def head_names(prefix: str) -> list[str]:
-            return [
-                f"{prefix}.head.{head_idx}.{row_idx}"
-                for head_idx in range(num_heads)
-                for row_idx in range(head_dim)
-            ]
-
-        for head_idx in range(num_heads):
-            symmeters.set_equivalence_class(
-                qk_symmetry_names[head_idx],
-                [
-                    f"{name}.self.query.weight.head.{head_idx}",
-                    f"{name}.self.key.weight.head.{head_idx}",
-                ],
-            )
-            symmeters.set_equivalence_class(
-                ov_symmetry_names[head_idx],
-                [
-                    f"{name}.self.value.weight.head.{head_idx}",
-                    f"{name}.output.dense.weight.head.{head_idx}",
-                ],
-            )
-
-        for matrix_name in ["query", "key", "value"]:
-            qkv = getattr(attention.self, matrix_name)
-            symmetry_names = qk_symmetry_names if matrix_name in {"query", "key"} else ov_symmetry_names
-            symmeters["model"] += self.serialize_matrix(
-                qkv.weight,
-                names=head_names(f"{name}.self.{matrix_name}.weight"),
-            )
-            head_biases = self.serialize_head_biases(
-                qkv.bias,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                name=f"{name}.self.{matrix_name}",
-            )
-            for head_idx, bias_name in enumerate(head_biases.names):
-                symmeters[symmetry_names[head_idx]] += NamedSerialParameters.from_vector_list(
-                    [bias_name],
-                    [head_biases.vectors[head_idx : head_idx + 1]],
-                )
-
-        symmeters["model"] += self.serialize_matrix(
-            attention.output.dense.weight.T,
-            names=head_names(f"{name}.output.dense.weight"),
+    if not tied:
+        component_name = f"{name}.decoder.weight"
+        symmeters.add_component(
+            "decoder",
+            component_name,
+            params.decoder.weight,
+            axes=("vocab_items", "decoder"),
+            kind="weight",
+            layout="identity",
+            parameter_keys=component_name,
         )
-        symmeters["model"] += self.serialize_bias(attention.output.dense.bias, name=f"{name}.output.dense")
-        if attention.output.LayerNorm is not None:
-            symmeters["model"] += self.serialize_layernorm(
-                attention.output.LayerNorm,
-                name=f"{name}.output.LayerNorm",
-            )
-        return symmeters
+    component_name = f"{name}.decoder.bias"
+    symmeters.add_component(
+        "vocab",
+        component_name,
+        params.decoder.bias,
+        axes=("vocab",),
+        kind="bias",
+        layout="identity",
+        parameter_keys=component_name,
+    )
+    return symmeters
 
-    def serialize_encoder_layer(
-        self,
-        layer: Any,
-        layer_idx: int,
-        name: str | None = None,
-    ) -> Symmeters:
-        """Serialize a single encoder layer including attention, MLP, and LayerNorm blocks."""
-        if name is None:
-            name = f"{self.base_model_prefix}.encoder.layer.{layer_idx}"
-        symmeters = self.serialize_attention(layer.attention, layer_idx=layer_idx, name=f"{name}.attention")
-        symmeters[f"L{layer_idx}.mlp"] = NamedSerialParameters()
-        symmeters.set_equivalence_class(
-            f"L{layer_idx}.mlp",
-            [f"{name}.intermediate.dense", f"{name}.output.dense.weight"],
-        )
-        symmeters["model"] += self.serialize_matrix(
-            layer.intermediate.dense.weight,
-            name=f"{name}.intermediate.dense",
-        )
-        symmeters[f"L{layer_idx}.mlp"] += self.serialize_bias(
-            layer.intermediate.dense.bias,
-            name=f"{name}.intermediate.dense",
-        )
-        symmeters["model"] += self.serialize_matrix(
-            layer.output.dense.weight.T,
-            name=f"{name}.output.dense.weight",
-        )
-        symmeters["model"] += self.serialize_bias(layer.output.dense.bias, name=f"{name}.output.dense")
-        if layer.output.LayerNorm is not None:
-            symmeters["model"] += self.serialize_layernorm(layer.output.LayerNorm, name=f"{name}.output.LayerNorm")
-        return symmeters
 
-    def serialize_encoder(self, name: str | None = None) -> Symmeters:
-        """Serialize every encoder layer in order."""
-        if name is None:
-            name = f"{self.base_model_prefix}.encoder"
-        symmeters = Symmeters()
-        for layer_idx, layer in enumerate(self.base_model.encoder.layer):
-            symmeters += self.serialize_encoder_layer(layer, layer_idx=layer_idx, name=f"{name}.layer.{layer_idx}")
-        return symmeters
+def serialize_model(model: Any) -> Symmeters:
+    symmeters = Symmeters([])
+    symmeters += serialize_embeddings(model)
+    symmeters += serialize_encoder(model)
+    symmeters += serialize_mlm_head(model)
+    return symmeters
 
-    def serialize_mlm_head(self, name: str = "cls.predictions") -> Symmeters:
-        """Serialize the masked-language-model head."""
-        params = self.cls.predictions
-        symmeters = Symmeters(["model", "decoder", "vocab"])
-        symmeters.set_equivalence_class("decoder", [f"{name}.transform.dense.weight"])
-        symmeters["decoder"] += self.serialize_matrix(
-            params.transform.dense.weight,
-            name=f"{name}.transform.dense.weight",
-        )
-        symmeters["decoder"] += self.serialize_bias(params.transform.dense.bias, name=f"{name}.transform.dense")
-        if params.transform.LayerNorm is not None:
-            symmeters["decoder"] += self.serialize_layernorm(params.transform.LayerNorm, name=f"{name}.transform.LayerNorm")
-        symmeters["decoder"] += self.serialize_matrix(params.decoder.weight, name=f"{name}.decoder.weight")
-        symmeters["vocab"] += self.serialize_bias(params.decoder.bias, name=f"{name}.decoder")
-        return symmeters
 
-    def serialize(self) -> Symmeters:
-        """Serialize embeddings, encoder layers, and MLM head into one flat row collection."""
-        symmeters = Symmeters([])
-        symmeters += self.serialize_embeddings()
-        symmeters += self.serialize_encoder()
-        symmeters += self.serialize_mlm_head()
-        if self.cls.predictions.decoder.weight.data_ptr() == self.base_model.embeddings.word_embeddings.weight.data_ptr():
-            if "decoder" in symmeters.symmetry_names:
-                symmeters["model"] += symmeters["decoder"].filter(lambda name: "decoder.weight" not in name)
-                symmeters.set_equivalence_class(
-                    "model",
-                    [*symmeters.get_equivalence_class("model"), "cls.predictions.transform.dense.weight"],
-                )
-                del symmeters["decoder"]
-        return symmeters
+def _materialize_component_override(component) -> dict[str, torch.Tensor]:
+    tensor = component.tensor
+    parameter_keys = component.parameter_keys
+    layout = component.layout
 
-    @classmethod
-    def _deserialize_embeddings(
-        cls,
-        model: Any,
-        overrides: SerializedParameterOverrides,
-        name: str | None = None,
-    ) -> None:
-        if name is None:
-            name = f"{model.base_model_prefix}.embeddings"
-        params = model.base_model.embeddings
-        overrides.matrix(f"{name}.word_embeddings.weight", params.word_embeddings.num_embeddings)
-        overrides.matrix(f"{name}.position_embeddings.weight", params.position_embeddings.num_embeddings)
-        overrides.matrix(f"{name}.token_type_embeddings.weight", params.token_type_embeddings.num_embeddings)
-        if overrides.optional_layernorm(f"{name}.LayerNorm") is None:
-            params.LayerNorm = None
+    if layout == "identity":
+        return {parameter_keys[0]: tensor}
+    if layout == "transpose":
+        return {parameter_keys[0]: tensor.T}
+    if layout == "head_rows":
+        return {parameter_keys[0]: tensor.reshape(-1, tensor.shape[-1])}
+    if layout == "head_rows_transposed":
+        return {parameter_keys[0]: tensor.reshape(-1, tensor.shape[-1]).T}
+    if layout == "head_bias":
+        return {parameter_keys[0]: tensor.reshape(-1)}
+    if layout == "layernorm":
+        return {
+            parameter_keys[0]: tensor[0],
+            parameter_keys[1]: tensor[1],
+        }
+    raise ValueError(f"Unsupported parameter component layout {layout}.")
 
-    @classmethod
-    def _deserialize_attention(
-        cls,
-        attention: Any,
-        overrides: SerializedParameterOverrides,
-        layer_idx: int,
-        name: str,
-    ) -> None:
-        num_heads = attention.self.num_attention_heads
-        head_dim = attention.self.attention_head_size
-        qk_symmetry_names = [f"L{layer_idx}.H{head_idx}.qk" for head_idx in range(num_heads)]
-        ov_symmetry_names = [f"L{layer_idx}.H{head_idx}.ov" for head_idx in range(num_heads)]
-        for matrix_name, suffix in [("query", "qk"), ("key", "qk"), ("value", "ov")]:
-            overrides.head_matrix(
-                f"{name}.self.{matrix_name}.weight",
-                num_heads=num_heads,
-                head_dim=head_dim,
-            )
-            overrides.head_bias(
-                f"{name}.self.{matrix_name}.bias",
-                symmetry_names=qk_symmetry_names if suffix == "qk" else ov_symmetry_names,
-            )
-        overrides.head_matrix(
-            f"{name}.output.dense.weight",
-            num_heads=num_heads,
-            head_dim=head_dim,
-            transpose=True,
-        )
-        overrides.bias(f"{name}.output.dense.bias")
-        if overrides.optional_layernorm(f"{name}.output.LayerNorm") is None:
-            attention.output.LayerNorm = None
 
-    @classmethod
-    def _deserialize_encoder_layer(
-        cls,
-        layer: Any,
-        overrides: SerializedParameterOverrides,
-        layer_idx: int,
-        name: str,
-    ) -> None:
-        cls._deserialize_attention(layer.attention, overrides, layer_idx, name=f"{name}.attention")
-        overrides.matrix(
-            f"{name}.intermediate.dense.weight",
-            layer.intermediate.dense.out_features,
-            src=f"{name}.intermediate.dense",
-        )
-        overrides.bias(
-            f"{name}.intermediate.dense.bias",
-            symmetry=f"L{layer_idx}.mlp",
-            src=f"{name}.intermediate.dense",
-        )
-        overrides.matrix(
-            f"{name}.output.dense.weight",
-            layer.output.dense.in_features,
-            transpose=True,
-        )
-        overrides.bias(f"{name}.output.dense.bias")
-        if overrides.optional_layernorm(f"{name}.output.LayerNorm") is None:
+def _build_overrides(serialized_symmeters: Symmeters) -> dict[str, torch.Tensor]:
+    overrides: dict[str, torch.Tensor] = {}
+    for _, _, component in serialized_symmeters.iter_components():
+        for parameter_key, tensor in _materialize_component_override(component).items():
+            if parameter_key in overrides:
+                raise ValueError(f"Duplicate parameter override for {parameter_key}.")
+            overrides[parameter_key] = tensor
+    return overrides
+
+
+def _has_parameter_key(serialized_symmeters: Symmeters, parameter_key: str) -> bool:
+    return any(parameter_key in component.parameter_keys for _, _, component in serialized_symmeters.iter_components())
+
+
+def _configure_optional_modules(model: Any, serialized_symmeters: Symmeters):
+    embeddings_prefix = f"{model.base_model_prefix}.embeddings.LayerNorm"
+    if not serialized_symmeters.has_component(embeddings_prefix, symmetry_name="model"):
+        model.base_model.embeddings.LayerNorm = None
+
+    for layer_idx, layer in enumerate(model.base_model.encoder.layer):
+        attention_ln = f"{model.base_model_prefix}.encoder.layer.{layer_idx}.attention.output.LayerNorm"
+        if not serialized_symmeters.has_component(attention_ln, symmetry_name="model"):
+            layer.attention.output.LayerNorm = None
+
+        output_ln = f"{model.base_model_prefix}.encoder.layer.{layer_idx}.output.LayerNorm"
+        if not serialized_symmeters.has_component(output_ln, symmetry_name="model"):
             layer.output.LayerNorm = None
 
-    @classmethod
-    def _deserialize_encoder(
-        cls,
-        model: Any,
-        overrides: SerializedParameterOverrides,
-        name: str | None = None,
-    ) -> None:
-        if name is None:
-            name = f"{model.base_model_prefix}.encoder"
-        for layer_idx, layer in enumerate(model.base_model.encoder.layer):
-            cls._deserialize_encoder_layer(layer, overrides, layer_idx, name=f"{name}.layer.{layer_idx}")
-
-    @classmethod
-    def _deserialize_mlm_head(
-        cls,
-        model: Any,
-        overrides: SerializedParameterOverrides,
-        tie_embeddings: bool,
-        name: str = "cls.predictions",
-    ) -> None:
-        params = model.cls.predictions
-        aux_symmetry = "model" if tie_embeddings else "decoder"
-        overrides.matrix(f"{name}.transform.dense.weight", params.transform.dense.out_features, symmetry=aux_symmetry)
-        overrides.bias(f"{name}.transform.dense.bias", symmetry=aux_symmetry)
-        if overrides.optional_layernorm(f"{name}.transform.LayerNorm", symmetry=aux_symmetry) is None:
-            params.transform.LayerNorm = None
-        if not tie_embeddings:
-            overrides.matrix(f"{name}.decoder.weight", params.decoder.out_features, symmetry="decoder")
-        overrides.bias(f"{name}.decoder.bias", symmetry="vocab")
-
-    @classmethod
-    def load_serialized(
-        cls,
-        serialized_symmeters: Symmeters,
-        pretrained_model_name_or_path: str,
-        *model_args: Any,
-        **kwargs: Any,
-    ) -> tuple[Any, dict[str, torch.Tensor]]:
-        """Build a shell model and differentiable overrides from serialized parameters."""
-        if isinstance(serialized_symmeters, NamedSerialParameters):
-            raise TypeError("load_serialized expects Symmeters.")
-        model = cls.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        overrides = SerializedParameterOverrides(serialized_symmeters)
-        should_tie_embeddings = not overrides.has_prefix("cls.predictions.decoder.weight")
-        if not should_tie_embeddings:
-            model.cls.predictions.decoder.weight = torch.nn.Parameter(model.cls.predictions.decoder.weight.detach().clone())
-        cls._deserialize_embeddings(model, overrides)
-        cls._deserialize_encoder(model, overrides)
-        cls._deserialize_mlm_head(model, overrides, should_tie_embeddings)
-        if should_tie_embeddings:
-            model.cls.predictions.decoder.weight = model.base_model.embeddings.word_embeddings.weight
-        overrides.assert_done()
-        return model, overrides
-    
-    def has_tied_input_output_embeddings(self):
-        return (
-            self.base_model.embeddings.word_embeddings.weight.data_ptr()
-            == self.cls.predictions.decoder.weight.data_ptr()
-        )
+    tied = not _has_parameter_key(serialized_symmeters, "cls.predictions.decoder.weight")
+    mlm_owner = "model" if tied else "decoder"
+    if not serialized_symmeters.has_component("cls.predictions.transform.LayerNorm", symmetry_name=mlm_owner):
+        model.cls.predictions.transform.LayerNorm = None
 
 
-    def untie_input_output_embeddings(self):
-        self.cls.predictions.decoder.weight = torch.nn.Parameter(
-            self.cls.predictions.decoder.weight.detach().clone()
-        )
-        return self
+def load_serialized(
+    serialized_symmeters: Symmeters,
+    pretrained_model_name_or_path: str,
+    *model_args: Any,
+    **kwargs: Any,
+) -> tuple[Any, dict[str, torch.Tensor]]:
+    if not isinstance(serialized_symmeters, Symmeters):
+        raise TypeError("load_serialized expects Symmeters.")
+
+    model = AutoModelForMaskedLM.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+    should_tie_embeddings = not _has_parameter_key(serialized_symmeters, "cls.predictions.decoder.weight")
+    if should_tie_embeddings:
+        model.cls.predictions.decoder.weight = model.base_model.embeddings.word_embeddings.weight
+    else:
+        untie_input_output_embeddings(model)
+
+    _configure_optional_modules(model, serialized_symmeters)
+    overrides = _build_overrides(serialized_symmeters)
+    return model, overrides

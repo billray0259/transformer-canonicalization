@@ -1,133 +1,515 @@
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from lib.canonical_scope import BatchedCanonicalizationScope, CanonicalizationScope
+from lib.serial_params import ParameterComponent, Symmeters
 from lib.utils import sinkhorn
-from lib.serial_params import Symmeters
 
 
-class DimensionAligner(torch.nn.Module):
-    
+def _flatten_component_for_axis(
+    component: ParameterComponent,
+    axis_name: str,
+    bank_axis_name: str | None = None,
+) -> torch.Tensor | None:
+    axis_indices = component.axis_indices(axis_name)
+    if len(axis_indices) != 1:
+        return None
+    axis_index = axis_indices[0]
+
+    if bank_axis_name is not None:
+        bank_axis_indices = component.axis_indices(bank_axis_name)
+        if len(bank_axis_indices) != 1:
+            return None
+        bank_axis_index = bank_axis_indices[0]
+        tensor = component.tensor.movedim((bank_axis_index, axis_index), (0, -1))
+        return tensor.reshape(tensor.shape[0], -1, tensor.shape[-1])
+
+    tensor = component.tensor.movedim(axis_index, -1)
+    return tensor.reshape(-1, tensor.shape[-1])
+
+
+def _module_key(symmetry_name: str) -> str:
+    return symmetry_name.replace(".", "__dot__")
+
+
+# class DimensionAligner(nn.Module):
+#     def __init__(self, known_size: int, hidden_size: int, unknown_size: int, sinkhorn_iters: int = 20):
+#         super().__init__()
+#         self.known_size = known_size
+#         self.hidden_size = hidden_size
+#         self.unknown_size = unknown_size
+#         self.sinkhorn_iters = sinkhorn_iters
+
+#         self.descriptor = nn.Linear(known_size, hidden_size)
+#         self.gelu = nn.GELU()
+#         self.W_q = nn.Parameter(torch.empty(hidden_size, unknown_size))
+#         self.W_k = nn.Parameter(torch.empty(hidden_size, unknown_size))
+#         nn.init.normal_(self.W_q, std=1.0 / math.sqrt(hidden_size))
+#         nn.init.normal_(self.W_k, std=1.0 / math.sqrt(hidden_size))
+
+#     def forward(self, evidence: torch.Tensor, tau: float = 1.0):
+#         evidence_t = evidence.permute(0, 2, 1)
+#         evidence_t = self.descriptor(evidence_t)
+#         evidence_t = self.gelu(evidence_t)
+#         queries = evidence_t @ self.W_q
+#         keys = evidence_t @ self.W_k
+#         logits = (queries @ keys.permute(0, 2, 1)) / math.sqrt(self.hidden_size)
+#         transport = sinkhorn(logits / tau, n_iters=self.sinkhorn_iters)
+#         return transport.transpose(-1, -2)
+
+class PermutationAligner(nn.Module):
     def __init__(self, known_size, unknown_size, sinkhorn_iters=20):
         super().__init__()
-        self.known_size = known_size
-        self.unknown_size = unknown_size
+        # Learned prototypes: one per canonical position
+        self.prototypes = nn.Parameter(torch.randn(known_size, unknown_size) / math.sqrt(known_size))
         self.sinkhorn_iters = sinkhorn_iters
+
+    def forward(self, evidence, tau=1.0):
+        # evidence: (batch, known_size, unknown_size)
+        rows = evidence.permute(0, 2, 1)  # (batch, unknown_size, known_size)
+        logits = (rows @ self.prototypes) / tau
+        transport = sinkhorn(logits, n_iters=self.sinkhorn_iters)
         
-        self.W_q = nn.Parameter(torch.empty(known_size, unknown_size))
-        self.W_k = nn.Parameter(torch.empty(known_size, unknown_size))
-        nn.init.normal_(self.W_q, std=1.0 / math.sqrt(known_size))
-        nn.init.normal_(self.W_k, std=1.0 / math.sqrt(known_size))
-        
+        return transport, logits
     
-    def forward(self, W_x, tau=1.0): # W_x shape = (batch_size, known_size, unknown_size)
-        W_xt = W_x.permute(0, 2, 1) # (batch_size, unknown_size, known_size)
-        Q = W_xt @ self.W_q  # (batch, unknown_size, unknown_size)
-        K = W_xt @ self.W_k  # (batch, unknown_size, unknown_size)
-        attention_logits = (Q @ K.permute(0, 2, 1)) / math.sqrt(self.unknown_size)
-
-        # Sinkhorn normalization -> soft permutation matrix P
-        P = sinkhorn(attention_logits / tau, n_iters=self.sinkhorn_iters)
-        return P.transpose(-1, -2)
-
-
-class Canonicalizer(torch.nn.Module):
-    
-    def __init__(self, symmeters: Symmeters, sinkhorn_iters=20):
+class RotationAligner(nn.Module):
+    def __init__(self, known_size, unknown_size):
         super().__init__()
-        self.symmeters = symmeters
-        self.d_model = symmeters["model"].shape[1]
+        self.prototypes = nn.Parameter(torch.randn(unknown_size, known_size) / math.sqrt(known_size))
+
+    def forward(self, evidence):
+        # evidence: (batch, known_size, unknown_size)
+        # M = prototypes^T @ evidence, batched
+        M = (self.prototypes)[None] @ evidence  # (batch, unknown, unknown)
+        U, S, Vh = torch.linalg.svd(M)
+        R = U @ Vh
+        return R
+
+class HeadDescriptorEncoder(nn.Module):
+    def __init__(self, component_specs, axis_name: str, descriptor_size: int = 64):
+        super().__init__()
+        self.axis_name = axis_name
+        self.projectors = nn.ModuleDict()
+        self.projector_specs: list[tuple[str, str, str]] = []
+        projected_width = 0
+        for symmetry_name, component_name, component in component_specs:
+            flattened = _flatten_component_for_axis(component, axis_name)
+            if flattened is None:
+                continue
+            feature_dim = flattened.shape[0]
+            projector_key = f"{_module_key(symmetry_name)}::{component_name.replace('.', '__dot__')}"
+            self.projectors[projector_key] = nn.Linear(feature_dim, descriptor_size // 2, bias=False)
+            self.projector_specs.append((projector_key, symmetry_name, component_name))
+            projected_width += descriptor_size // 2
+        self.mlp = nn.Sequential(
+            nn.Linear(projected_width, descriptor_size),
+            nn.GELU(),
+            nn.Linear(descriptor_size, descriptor_size),
+        )
+
+    def forward(self, symmeters: Symmeters) -> torch.Tensor:
+        projected = []
+        for projector_key, symmetry_name, component_name in self.projector_specs:
+            component = symmeters.component(symmetry_name, component_name)
+            flattened = _flatten_component_for_axis(component, self.axis_name)
+            projected.append(self.projectors[projector_key](flattened.T))
+        return self.mlp(torch.cat(projected, dim=-1))
+
+
+class HeadAligner(nn.Module):
+    def __init__(self, component_specs, axis_name: str, descriptor_size: int = 64, sinkhorn_iters: int = 20):
+        super().__init__()
+        self.encoder = HeadDescriptorEncoder(component_specs, axis_name=axis_name, descriptor_size=descriptor_size)
+        self.sinkhorn_iters = sinkhorn_iters
+        self.scale = math.sqrt(descriptor_size)
+
+    def forward(self, symmeters: Symmeters, tau: float = 1.0):
+        descriptors = self.encoder(symmeters)
+        logits = (descriptors @ descriptors.T) / self.scale
+        transport = sinkhorn(logits.unsqueeze(0) / tau, n_iters=self.sinkhorn_iters)[0].squeeze(0).T
+        return transport
+
+
+class CascadingTemplateCanonicalizer(nn.Module):
+    def __init__(self, order: Sequence[str], templates: dict[str, torch.Tensor | dict[str, torch.Tensor]]):
+        super().__init__()
+        self.order = tuple(order)
+        missing = [symmetry_name for symmetry_name in self.order if symmetry_name not in templates]
+        if missing:
+            raise ValueError(f"Missing templates for symmetries {missing}.")
+
+        self._buffer_names: dict[str, str | dict[str, str] | dict[str, object]] = {}
+        for symmetry_name in self.order:
+            self._buffer_names[symmetry_name] = self._register_template(symmetry_name, templates[symmetry_name])
+
+    def _register_template(self, symmetry_name: str, template, path: tuple[str, ...] = ()):
+        if isinstance(template, dict):
+            return {
+                kind: self._register_template(symmetry_name, value, (*path, kind))
+                for kind, value in template.items()
+            }
+
+        suffix = "__".join(path)
+        buffer_name = f"template__{_module_key(symmetry_name)}"
+        if suffix:
+            buffer_name = f"{buffer_name}__{suffix}"
+        self.register_buffer(buffer_name, template.detach().clone())
+        return buffer_name
+
+    def _materialize_template(self, buffer_names):
+        if isinstance(buffer_names, dict):
+            return {
+                kind: self._materialize_template(child)
+                for kind, child in buffer_names.items()
+            }
+        return getattr(self, buffer_names)
+
+    @staticmethod
+    def _cpu_template(template):
+        if isinstance(template, dict):
+            return {kind: CascadingTemplateCanonicalizer._cpu_template(value) for kind, value in template.items()}
+        return template.detach().cpu()
+
+    def template(self, symmetry_name: str) -> torch.Tensor | dict[str, torch.Tensor]:
+        if symmetry_name not in self._buffer_names:
+            raise KeyError(f"Unknown symmetry {symmetry_name}.")
+        return self._materialize_template(self._buffer_names[symmetry_name])
+
+    @staticmethod
+    def procrustes_align(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        matrix = source.transpose(-1, -2) @ target
+        u, _, vh = torch.linalg.svd(matrix)
+        return u @ vh
+
+    @staticmethod
+    def inverse_transpose(matrix: torch.Tensor) -> torch.Tensor:
+        return torch.linalg.inv(matrix).transpose(-1, -2)
+
+    @staticmethod
+    def attention_dual_roles(symmetry_name: str) -> tuple[str, str] | None:
+        if symmetry_name.endswith(".qk"):
+            return ("query", "key")
+        if symmetry_name.endswith(".ov"):
+            return ("value", "output")
+        return None
+
+    @classmethod
+    def polar_align(cls, target: torch.Tensor, source: torch.Tensor, min_singular_value: float = 1e-6) -> torch.Tensor:
+        linear_map = torch.linalg.lstsq(source, target).solution
+        u, singular_values, vh = torch.linalg.svd(linear_map)
+        rotation = u @ vh
+        stretch = vh.transpose(-1, -2) @ torch.diag_embed(singular_values.clamp_min(min_singular_value)) @ vh
+        return rotation @ stretch
+
+    @staticmethod
+    def apply_evidence_transform(evidence: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+        if evidence.ndim == 2:
+            return evidence @ matrix
+        if evidence.ndim == 3:
+            return torch.einsum("hkd,hde->hke", evidence, matrix)
+        raise ValueError(f"Unexpected evidence rank: {evidence.ndim}")
+
+    @staticmethod
+    def attention_dual_role(symmetry_name: str, component_name: str, component: ParameterComponent) -> str | None:
+        names = (component_name, *component.parameter_keys)
+        if symmetry_name.endswith(".qk"):
+            if any(".query." in name or name.startswith("query.") for name in names):
+                return "query"
+            if any(".key." in name or name.startswith("key.") for name in names):
+                return "key"
+            return None
+
+        if any(".self.value." in name or ".value." in name or name.startswith("value.") for name in names):
+            return "value"
+        if any(".output.dense.weight" in name or name.startswith("output.dense.weight") for name in names):
+            return "output"
+        return None
+
+    @classmethod
+    def attention_dual_evidence(cls, symmeters: Symmeters, symmetry_name: str) -> dict[str, torch.Tensor]:
+        roles = cls.attention_dual_roles(symmetry_name)
+        if roles is None:
+            raise ValueError(f"Symmetry {symmetry_name} is not a dual-action attention symmetry.")
+
+        bank_axis_name = symmeters.transform_bank_axis(symmetry_name)
+        cat_dim = 1 if bank_axis_name is not None else 0
+        grouped = {role: [] for role in roles}
+
+        for component_name, component in symmeters.owned_components(symmetry_name).items():
+            role = cls.attention_dual_role(symmetry_name, component_name, component)
+            if role is None:
+                continue
+            flattened = _flatten_component_for_axis(component, symmetry_name, bank_axis_name=bank_axis_name)
+            if flattened is not None:
+                grouped[role].append(flattened.float())
+
+        if any(not grouped[role] for role in roles):
+            raise ValueError(f"No dual-action evidence found for symmetry {symmetry_name}.")
+        return {role: torch.cat(grouped[role], dim=cat_dim) for role in roles}
+
+    @classmethod
+    def apply_attention_dual_evidence_transform(
+        cls,
+        evidence: dict[str, torch.Tensor],
+        matrix: torch.Tensor,
+        symmetry_name: str,
+    ) -> dict[str, torch.Tensor]:
+        roles = cls.attention_dual_roles(symmetry_name)
+        if roles is None:
+            raise ValueError(f"Symmetry {symmetry_name} is not a dual-action attention symmetry.")
+
+        dual_matrix = cls.inverse_transpose(matrix)
+        return {
+            roles[0]: cls.apply_evidence_transform(evidence[roles[0]], matrix),
+            roles[1]: cls.apply_evidence_transform(evidence[roles[1]], dual_matrix),
+        }
+
+    @staticmethod
+    def permutation_align(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        from scipy.optimize import linear_sum_assignment
+
+        scores = (source.T @ target).detach().cpu().numpy()
+        _, col_ind = linear_sum_assignment(scores, maximize=True)
+        return torch.eye(source.shape[1], device=source.device, dtype=source.dtype)[col_ind]
+
+    @staticmethod
+    def head_evidence(symmeters: Symmeters, symmetry_name: str) -> dict[str, torch.Tensor]:
+        prefix = symmetry_name.rsplit(".", 1)[0]
+        return {
+            "qk": CascadingTemplateCanonicalizer.attention_dual_evidence(symmeters, f"{prefix}.qk"),
+            "ov": CascadingTemplateCanonicalizer.attention_dual_evidence(symmeters, f"{prefix}.ov"),
+        }
+
+    @staticmethod
+    def apply_head_permutation(evidence: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("h...,hj->j...", evidence, matrix)
+
+    @classmethod
+    def head_permutation_align(cls, target: dict[str, torch.Tensor], source: dict[str, torch.Tensor]) -> torch.Tensor:
+        from scipy.optimize import linear_sum_assignment
+
+        num_heads = source["qk"]["query"].shape[0]
+        costs = torch.empty(
+            (num_heads, num_heads),
+            device=source["qk"]["query"].device,
+            dtype=source["qk"]["query"].dtype,
+        )
+        for target_head in range(num_heads):
+            for source_head in range(num_heads):
+                cost = 0.0
+                for kind in ("qk", "ov"):
+                    symmetry = f"L0.{kind}"
+                    roles = cls.attention_dual_roles(symmetry)
+                    matrix = cls.procrustes_align(
+                        target[kind][roles[0]][target_head],
+                        source[kind][roles[0]][source_head],
+                    )
+                    aligned = cls.apply_attention_dual_evidence_transform(
+                        {
+                            role: source[kind][role][source_head]
+                            for role in roles
+                        },
+                        matrix,
+                        symmetry,
+                    )
+                    for role in roles:
+                        cost += (aligned[role] - target[kind][role][target_head]).pow(2).mean()
+                costs[target_head, source_head] = cost
+        _, col_ind = linear_sum_assignment(costs.detach().cpu().numpy())
+        return torch.eye(num_heads, device=source["qk"]["query"].device, dtype=source["qk"]["query"].dtype)[col_ind]
+
+    @staticmethod
+    def head_descriptor(symmeters: Symmeters, symmetry_name: str) -> torch.Tensor:
+        pieces = []
+        for _, _, component in symmeters.components_with_axis(symmetry_name):
+            flattened = _flatten_component_for_axis(component, symmetry_name)
+            if flattened is not None:
+                pieces.append(flattened.float())
+        if not pieces:
+            raise ValueError(f"No head evidence for {symmetry_name}.")
+        return torch.cat(pieces, dim=0)
+
+    def infer_transform(self, symmeters: Symmeters, symmetry_name: str) -> torch.Tensor:
+        template = self.template(symmetry_name)
+        if symmetry_name.endswith(".head"):
+            head_evidence = self.head_evidence(symmeters, symmetry_name)
+            evidence = {
+                kind: {
+                    role: tensor.to(device=template[kind][role].device, dtype=template[kind][role].dtype)
+                    for role, tensor in head_evidence[kind].items()
+                }
+                for kind in ("qk", "ov")
+            }
+            return self.head_permutation_align(template, evidence)
+
+        if symmetry_name.endswith((".qk", ".ov")):
+            roles = self.attention_dual_roles(symmetry_name)
+            evidence = {
+                role: tensor.to(device=template[role].device, dtype=template[role].dtype)
+                for role, tensor in self.attention_dual_evidence(symmeters, symmetry_name).items()
+            }
+            return self.polar_align(template[roles[0]], evidence[roles[0]])
+
+        evidence = Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().to(device=template.device, dtype=template.dtype)
+        return self.procrustes_align(template, evidence)
+
+    @staticmethod
+    def apply_symmetry_transform(symmeters: Symmeters, symmetry_name: str, matrix: torch.Tensor):
+        if symmetry_name.endswith(".head"):
+            symmeters.apply_head_transport(symmetry_name, matrix)
+        elif symmetry_name.endswith((".qk", ".ov")):
+            symmeters.apply_attention_dual_transform(symmetry_name, matrix)
+        else:
+            symmeters.apply_transform(symmetry_name, matrix)
+        return symmeters
+
+    def canonicalize_with_transforms(self, symmeters: Symmeters) -> tuple[Symmeters, dict[str, torch.Tensor]]:
+        if not isinstance(symmeters, Symmeters):
+            raise TypeError("CascadingTemplateCanonicalizer.forward expects Symmeters.")
+
+        canonicalized = symmeters.clone()
+        inferred: dict[str, torch.Tensor] = {}
+        for symmetry_name in self.order:
+            matrix = self.infer_transform(canonicalized, symmetry_name)
+            self.apply_symmetry_transform(canonicalized, symmetry_name, matrix)
+            inferred[symmetry_name] = matrix
+        return canonicalized, inferred
+
+    def forward(self, symmeters: Symmeters) -> Symmeters:
+        canonicalized, _ = self.canonicalize_with_transforms(symmeters)
+        return canonicalized
+
+    def save(self, path: str):
+        torch.save(
+            {
+                "order": self.order,
+                "templates": {
+                    symmetry_name: self._cpu_template(self.template(symmetry_name))
+                    for symmetry_name in self.order
+                },
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str, map_location=None):
+        data = torch.load(path, map_location=map_location)
+        return cls(data["order"], data["templates"])
+
+
+class Canonicalizer(nn.Module):
+    def __init__(self, symmeters: Symmeters, sinkhorn_iters: int = 20, head_descriptor_size: int = 64):
+        super().__init__()
         self.dimension_aligners = nn.ModuleDict()
-        self.vocab_size = symmeters["vocab"].shape[1]
-        self.dimension_aligners["model"] = DimensionAligner(self.vocab_size, self.d_model, sinkhorn_iters=sinkhorn_iters)
-        
-        for symmetry, parameters in symmeters.items():
-            if symmetry in {"model", "vocab"} or parameters.vectors is None:
+        self.head_aligners = nn.ModuleDict()
+
+        for symmetry_name in symmeters.ordered_transform_names():
+            if symmetry_name.endswith(".head"):
+                component_specs = symmeters.components_with_axis(symmetry_name)
+                if component_specs:
+                    self.head_aligners[_module_key(symmetry_name)] = HeadAligner(
+                        component_specs,
+                        axis_name=symmetry_name,
+                        descriptor_size=head_descriptor_size,
+                        sinkhorn_iters=sinkhorn_iters,
+                    )
                 continue
-            prefixes = symmeters.get_equivalence_class(symmetry)
-            if not prefixes:
+
+            try:
+                evidence = self._evidence_tensor(symmeters, symmetry_name)
+            except ValueError:
                 continue
-            self.dimension_aligners[symmetry] = DimensionAligner(
-                self.d_model * len(prefixes),
-                parameters.shape[1],
+            self.dimension_aligners[_module_key(symmetry_name)] = PermutationAligner(
+                known_size=evidence.shape[-2],
+                unknown_size=evidence.shape[-1],
                 sinkhorn_iters=sinkhorn_iters,
             )
-        
-        
-    def _canonicalize_scope(self, scope: CanonicalizationScope, tau=1.0):
-        canonicalized = scope.symmeters.clone()
-        model_params = scope.symmeters["model"]
-        model_vectors = model_params.vectors
-        model_matrix = self.dimension_aligners["model"](
-            scope.model_conditioning_vectors.unsqueeze(0),
-            tau=tau,
-        ).squeeze(0)
-        canonicalized_model_vectors = torch.index_copy(
-            model_vectors,
-            0,
-            scope.model_active_indices,
-            scope.model_active_vectors @ model_matrix,
+
+    @staticmethod
+    def _evidence_tensor(symmeters: Symmeters, symmetry_name: str) -> torch.Tensor:
+        bank_axis_name = symmeters.transform_bank_axis(symmetry_name)
+
+        if bank_axis_name is None:
+            evidence_components = [
+                flattened
+                for component in symmeters.owned_components(symmetry_name).values()
+                for flattened in [_flatten_component_for_axis(component, symmetry_name)]
+                if flattened is not None
+            ]
+            if not evidence_components:
+                raise ValueError(f"No evidence components found for symmetry {symmetry_name}.")
+            return torch.cat(evidence_components, dim=0)
+
+        evidence_components = [
+            flattened
+            for component in symmeters.owned_components(symmetry_name).values()
+            for flattened in [_flatten_component_for_axis(component, symmetry_name, bank_axis_name=bank_axis_name)]
+            if flattened is not None
+        ]
+        if not evidence_components:
+            raise ValueError(f"No evidence components found for symmetry {symmetry_name}.")
+        return torch.cat(evidence_components, dim=1)
+
+    @staticmethod
+    def _normalize_active_symmetry_names(
+        symmeters: Symmeters,
+        active_symmetry_names: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        if "model" not in symmeters:
+            raise ValueError("Canonicalizer requires a model symmetry.")
+
+        normalized = tuple(active_symmetry_names) if active_symmetry_names is not None else tuple(
+            symmetry_name
+            for symmetry_name in symmeters.ordered_transform_names()
+            if symmetry_name != "model"
         )
-        canonicalized["model"] = model_params.with_vectors(canonicalized_model_vectors)
+        missing = [symmetry_name for symmetry_name in normalized if symmetry_name not in symmeters]
+        if missing:
+            raise ValueError(f"Canonicalizer received missing active symmetries {missing}.")
+        return normalized
 
-        for symmetry in scope.active_symmetry_names:
-            if symmetry not in self.dimension_aligners:
-                raise ValueError(f"Canonicalizer has no aligner for active symmetry {symmetry}.")
+    def _canonicalize_single(
+        self,
+        symmeters: Symmeters,
+        active_symmetry_names: Sequence[str] | None = None,
+        tau: float = 1.0,
+    ):
+        normalized_active_symmetry_names = self._normalize_active_symmetry_names(
+            symmeters,
+            active_symmetry_names=active_symmetry_names,
+        )
+        canonicalized = symmeters.clone()
+        for symmetry_name in ("model", *normalized_active_symmetry_names):
+            module_key = _module_key(symmetry_name)
+            if module_key in self.dimension_aligners:
+                evidence = self._evidence_tensor(canonicalized, symmetry_name)
+                if evidence.ndim == 2:
+                    matrix, _ = self.dimension_aligners[module_key](evidence.unsqueeze(0), tau=tau)
+                    matrix = matrix.squeeze(0)
+                else:
+                    matrix, _ = self.dimension_aligners[module_key](evidence, tau=tau)
+                canonicalized.apply_transform(symmetry_name, matrix)
+                continue
 
-            conditioning_block = scope.model_conditioning_block(
-                symmetry,
-                model_vectors=canonicalized["model"].vectors,
-            )
-            symmetry_matrix = self.dimension_aligners[symmetry](
-                conditioning_block.unsqueeze(0),
-                tau=tau,
-            ).squeeze(0)
-            canonicalized.apply_square_matrix(symmetry_matrix, symmetry)
-
+            if module_key in self.head_aligners:
+                matrix = self.head_aligners[module_key](canonicalized, tau=tau)
+                canonicalized.apply_head_transport(symmetry_name, matrix)
         return canonicalized
 
-    def _canonicalize_batched_scope(self, scope: BatchedCanonicalizationScope, tau=1.0):
-        canonicalized = [single_scope.symmeters.clone() for single_scope in scope.scopes]
-        model_matrices = self.dimension_aligners["model"](
-            scope.model_conditioning_vectors,
+    def forward(
+        self,
+        symmeters: Symmeters,
+        tau: float = 1.0,
+        active_symmetry_names: Sequence[str] | None = None,
+    ):
+        if not isinstance(symmeters, Symmeters):
+            raise TypeError("Canonicalizer.forward expects Symmeters.")
+        return self._canonicalize_single(
+            symmeters,
+            active_symmetry_names=active_symmetry_names,
             tau=tau,
-        )
-
-        for idx, (single_scope, model_matrix) in enumerate(zip(scope.scopes, model_matrices)):
-            model_params = single_scope.symmeters["model"]
-            model_vectors = model_params.vectors
-            canonicalized_model_vectors = torch.index_copy(
-                model_vectors,
-                0,
-                single_scope.model_active_indices,
-                single_scope.model_active_vectors @ model_matrix,
-            )
-            canonicalized[idx]["model"] = model_params.with_vectors(canonicalized_model_vectors)
-
-        for symmetry in scope.active_symmetry_names:
-            if symmetry not in self.dimension_aligners:
-                raise ValueError(f"Canonicalizer has no aligner for active symmetry {symmetry}.")
-
-            conditioning_block = scope.model_conditioning_block(
-                symmetry,
-                model_vectors=[item["model"].vectors for item in canonicalized],
-            )
-            symmetry_matrices = self.dimension_aligners[symmetry](conditioning_block, tau=tau)
-            for item, symmetry_matrix in zip(canonicalized, symmetry_matrices):
-                item.apply_square_matrix(symmetry_matrix, symmetry)
-
-        return canonicalized
-
-    def forward(self, scope: CanonicalizationScope | BatchedCanonicalizationScope, tau=1.0):
-        """Canonicalize one scope or a batch of compatible scopes."""
-
-        if isinstance(scope, BatchedCanonicalizationScope):
-            return self._canonicalize_batched_scope(scope, tau=tau)
-        if isinstance(scope, CanonicalizationScope):
-            return self._canonicalize_scope(scope, tau=tau)
-        raise TypeError(
-            "Canonicalizer.forward expects CanonicalizationScope or BatchedCanonicalizationScope."
         )
         
