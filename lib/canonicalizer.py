@@ -168,6 +168,8 @@ class CascadingTemplateCanonicalizer(nn.Module):
     def procrustes_align(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
         matrix = source.transpose(-1, -2) @ target
         u, _, vh = torch.linalg.svd(matrix)
+        sign, _ = torch.linalg.slogdet(u @ vh)
+        u[..., :, -1] *= sign.unsqueeze(-1)
         return u @ vh
 
     @staticmethod

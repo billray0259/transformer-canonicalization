@@ -1,317 +1,142 @@
-# %% Load MultiBERT seed 0 and serialize it with the current code
-from __future__ import annotations
-
-import tempfile
-
+# %%
+import contextlib
+import io
 import torch
-from transformers import AutoModelForMaskedLM
+import torch.nn.functional as F
+from datasets import load_dataset
+from transformers import AutoModelForMaskedLM, AutoTokenizer, logging as hf_logging
+from lib.canonicalizer import CascadingTemplateCanonicalizer
+from lib.serial_model import _build_overrides, serialize_model
+from experiments.canonicalization.interpolation_eval import canonicalize_subset, uncanonicalize, symmeters_to_model
 
-from lib.serial_model import serialize_model
-from lib.serial_params import ParameterComponent, Symmeters
+hf_logging.set_verbosity_error()
 
-torch.set_printoptions(sci_mode=False, precision=4)
+CKPT_PATH = "data/alignment_models/cascading_rotation_merge_many.ckpt.pt"
+SHELL_SEED = "google/multiberts-seed_0"
+NUM_TRAIN = 20
+NUM_TEST = 5
+TEST_SEEDS = list(range(NUM_TRAIN, NUM_TRAIN + NUM_TEST))
 
-model_name = "google/multiberts-seed_0"
-seed0_model = AutoModelForMaskedLM.from_pretrained(model_name)
-seed0_model.eval()
-seed0_symmeters = serialize_model(seed0_model)
-
-print("Loaded", model_name)
-print("symmetry count =", len(seed0_symmeters.symmetry_names))
-print("first 12 symmetry names =", seed0_symmeters.symmetry_names[:12])
-print("model size =", seed0_symmeters.symmetry_size("model"))
-print("L0.qk size =", seed0_symmeters.symmetry_size("L0.qk"))
-print("L0.head size =", seed0_symmeters.symmetry_size("L0.head"))
-print("L0.mlp size =", seed0_symmeters.symmetry_size("L0.mlp"))
+ckpt = torch.load(CKPT_PATH, weights_only=True, map_location="cpu")
+completed = ckpt["completed"]
+canonicalizer = CascadingTemplateCanonicalizer(completed, {k: ckpt["templates"][k] for k in completed})
 
 # %%
+print("Checking determinants of 'model' transforms for each test seed:\n")
+for seed in TEST_SEEDS:
+    with contextlib.redirect_stdout(io.StringIO()):
+        model = AutoModelForMaskedLM.from_pretrained(
+            f"google/multiberts-seed_{seed}", local_files_only=True
+        ).eval()
+    sym = serialize_model(model).clone()
+    del model
 
-for symmetry, components in seed0_symmeters.items():
-    print(f"{symmetry}")
-    for component_name, component in components.items():
-        print(f"\t{tuple(component.tensor.shape)}\t{component_name}")
+    _, transforms = canonicalize_subset(canonicalizer, sym, {"model"})
+    R = transforms["model"]
+    sign, logabsdet = torch.linalg.slogdet(R.double())
+    print(f"  Seed {seed}: sign={sign.item():+.0f}  logabsdet={logabsdet.item():.6f}  shape={tuple(R.shape)}")
 
+# %%
+# Single-model round-trip test: canonicalize → uncanonicalize should be identity.
+# Uses seed 20 as a representative test case.
+ROUNDTRIP_SEED = TEST_SEEDS[0]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+print(f"\nRound-trip test for seed {ROUNDTRIP_SEED}:")
 
-# %% ParameterComponent.from_payload on a real seed-0 component
-component_name = "bert.embeddings.word_embeddings.weight"
-component = seed0_symmeters.component("model", component_name)
-payload = component.to_payload()
-restored = ParameterComponent.from_payload(payload)
+with contextlib.redirect_stdout(io.StringIO()):
+    rt_model = AutoModelForMaskedLM.from_pretrained(
+        f"google/multiberts-seed_{ROUNDTRIP_SEED}", local_files_only=True
+    ).eval()
 
-print("component_name =", component_name)
-print("payload keys =", list(payload))
-print("restored.axes =", restored.axes)
-print("restored.kind =", restored.kind)
-print("restored.layout =", restored.layout)
-print("restored.parameter_keys =", restored.parameter_keys)
-print("restored.axis_indices('model') =", restored.axis_indices("model"))
-print("restored.has_axis('vocab_items') =", restored.has_axis("vocab_items"))
-print("restored.tensor[:2, :8] =")
-print(restored.tensor[:2, :8])
+sym = serialize_model(rt_model).clone()
+del rt_model
 
+# Build a small eval corpus for quick PPL checks
+tokenizer = AutoTokenizer.from_pretrained(SHELL_SEED, local_files_only=True)
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+text = " ".join(t for t in dataset["text"] if t.strip())
+token_ids = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+SEQ_LEN, N_SEQS, BATCH = 128, 50, 8
+seqs = torch.stack([token_ids[i * SEQ_LEN:(i + 1) * SEQ_LEN] for i in range(N_SEQS)])
 
-# %% Lookup helpers on the full serialized seed-0 object
-print("owned_components('L0.qk') =")
-print(list(seed0_symmeters.owned_components("L0.qk")))
+@torch.no_grad()
+def quick_ppl(model):
+    model.eval()
+    total, n = 0.0, 0
+    gen = torch.Generator(device=device).manual_seed(42)
+    for i in range(0, len(seqs), BATCH):
+        batch = seqs[i:i + BATCH].to(device)
+        prob = torch.full(batch.shape, 0.15, device=device)
+        mask = torch.bernoulli(prob, generator=gen).bool()
+        labels = batch.clone()
+        labels[~mask] = -100
+        masked = batch.clone()
+        masked[mask] = tokenizer.mask_token_id
+        total += model(input_ids=masked, labels=labels).loss.item()
+        n += 1
+    return float(torch.exp(torch.tensor(total / n)))
 
-query_bias = seed0_symmeters.get_component("bert.encoder.layer.0.attention.self.query.bias")
-print("\nget_component('bert.encoder.layer.0.attention.self.query.bias').axes =", query_bias.axes)
+model_before = symmeters_to_model(sym)
+ppl_before = quick_ppl(model_before)
+del model_before
 
-head_axis_components = [
-	(symmetry_name, component_name)
-	for symmetry_name, component_name, _ in seed0_symmeters.components_with_axis("L0.head")[:8]
-]
-print("\nfirst components_with_axis('L0.head') =", head_axis_components)
+canon, transforms = canonicalize_subset(canonicalizer, sym, {"model"})
+recovered = uncanonicalize(canonicalizer, canon, transforms)
 
-print("\nsymmetry_size('model') =", seed0_symmeters.symmetry_size("model"))
-print("symmetry_size('L0.qk') =", seed0_symmeters.symmetry_size("L0.qk"))
-print("symmetry_size('L0.head') =", seed0_symmeters.symmetry_size("L0.head"))
-print("transform_bank_axis('L0.qk') =", seed0_symmeters.transform_bank_axis("L0.qk"))
+model_after = symmeters_to_model(recovered)
+ppl_after = quick_ppl(model_after)
+del model_after
 
+print(f"  PPL before:  {ppl_before:.4f}")
+print(f"  PPL after:   {ppl_after:.4f}")
 
-# %% Merging two Symmeters built from real seed-0 components
-left = Symmeters.from_symmetry_dict(
-	{
-		"model": {
-			"bert.embeddings.word_embeddings.weight": seed0_symmeters.component(
-				"model",
-				"bert.embeddings.word_embeddings.weight",
-			),
-		}
-	}
-)
+# Weight-level deviation
+overrides_before = _build_overrides(sym)
+overrides_after = _build_overrides(recovered)
+large_diffs = {}
+for key in overrides_before:
+    diff = (overrides_before[key].float() - overrides_after[key].float()).abs().max().item()
+    if diff > 1e-4:
+        large_diffs[key] = diff
 
-right = Symmeters.from_symmetry_dict(
-	{
-		"model": {
-			"bert.encoder.layer.0.attention.output.dense.bias": seed0_symmeters.component(
-				"model",
-				"bert.encoder.layer.0.attention.output.dense.bias",
-			),
-		},
-		"L0.mlp": {
-			"bert.encoder.layer.0.intermediate.dense.bias": seed0_symmeters.component(
-				"L0.mlp",
-				"bert.encoder.layer.0.intermediate.dense.bias",
-			),
-		},
-	}
-)
+if large_diffs:
+    print(f"\n  Parameters with max_diff > 1e-4:")
+    for key, diff in sorted(large_diffs.items(), key=lambda x: -x[1])[:10]:
+        print(f"    {key}: {diff:.6f}")
+else:
+    print("\n  All weights within 1e-4 — round-trip is clean.")
 
-combined = left + right
+# %%
+# Weight-space similarity before and after canonicalization.
+# Check whether canonicalization brings weights closer together.
+# Pairs: (22,24) was a good pair (C/N≈0.373), (21,23) was a bad pair (C/N≈12.6).
 
-print("left =")
-print(left)
-print("\nright =")
-print(right)
-print("\ncombined =")
-print(combined)
-print("\ncombined.tensor('model', 'bert.encoder.layer.0.attention.output.dense.bias')[:8] =")
-print(combined.tensor("model", "bert.encoder.layer.0.attention.output.dense.bias")[:8])
+def weight_mse(sym_a, sym_b):
+    ov_a = _build_overrides(sym_a)
+    ov_b = _build_overrides(sym_b)
+    total, count = 0.0, 0
+    for key in ov_a:
+        total += (ov_a[key].float() - ov_b[key].float()).pow(2).mean().item()
+        count += 1
+    return total / count
 
+print("\nWeight-space MSE before/after model canonicalization:\n")
+for seed_a, seed_b in [(22, 24), (21, 23)]:
+    with contextlib.redirect_stdout(io.StringIO()):
+        hf_a = AutoModelForMaskedLM.from_pretrained(f"google/multiberts-seed_{seed_a}", local_files_only=True).eval()
+        hf_b = AutoModelForMaskedLM.from_pretrained(f"google/multiberts-seed_{seed_b}", local_files_only=True).eval()
+    sa = serialize_model(hf_a).clone()
+    sb = serialize_model(hf_b).clone()
+    del hf_a, hf_b
 
-# %% Shared model-axis transform on real seed-0 tensors
-model_only = Symmeters.from_symmetry_dict(
-	{
-		"model": {
-			"bert.embeddings.position_embeddings.weight": seed0_symmeters.component(
-				"model",
-				"bert.embeddings.position_embeddings.weight",
-			),
-			"cls.predictions.transform.dense.weight": seed0_symmeters.component(
-				"model",
-				"cls.predictions.transform.dense.weight",
-			),
-		}
-	}
-)
+    mse_raw = weight_mse(sa, sb)
+    ca, _ = canonicalize_subset(canonicalizer, sa, {"model"})
+    cb, _ = canonicalize_subset(canonicalizer, sb, {"model"})
+    mse_canon = weight_mse(ca, cb)
 
-model_swap = torch.eye(seed0_symmeters.symmetry_size("model"))
-model_swap[[0, 1]] = model_swap[[1, 0]]
+    delta = mse_canon - mse_raw
+    direction = "↓ better" if delta < 0 else "↑ WORSE"
+    print(f"  ({seed_a},{seed_b})  raw={mse_raw:.6f}  canon={mse_canon:.6f}  Δ={delta:+.6f}  {direction}")
 
-print("Before apply_transform('model', model_swap):")
-print("position_embeddings[:2, :8] =")
-print(model_only.tensor("model", "bert.embeddings.position_embeddings.weight")[:2, :8])
-print("\ncls.predictions.transform.dense.weight[:4, :4] =")
-print(model_only.tensor("model", "cls.predictions.transform.dense.weight")[:4, :4])
-print("\nmodel_swap[:4, :4] =")
-print(model_swap[:4, :4])
-
-model_only.apply_transform("model", model_swap)
-
-print("\nAfter apply_transform('model', model_swap):")
-print("position_embeddings[:2, :8] =")
-print(model_only.tensor("model", "bert.embeddings.position_embeddings.weight")[:2, :8])
-print("\ncls.predictions.transform.dense.weight[:4, :4] =")
-print(model_only.tensor("model", "cls.predictions.transform.dense.weight")[:4, :4])
-
-
-# %% Banked transform on the real L0.qk symmetry
-qk_only = Symmeters.from_symmetry_dict(
-	{
-		"L0.qk": {
-			"bert.encoder.layer.0.attention.self.query.weight": seed0_symmeters.component(
-				"L0.qk",
-				"bert.encoder.layer.0.attention.self.query.weight",
-			),
-			"bert.encoder.layer.0.attention.self.query.bias": seed0_symmeters.component(
-				"L0.qk",
-				"bert.encoder.layer.0.attention.self.query.bias",
-			),
-		},
-		"L0.head": {},
-	}
-)
-
-banked_qk = torch.eye(seed0_symmeters.symmetry_size("L0.qk")).repeat(seed0_symmeters.symmetry_size("L0.head"), 1, 1)
-banked_qk[0, [0, 1]] = banked_qk[0, [1, 0]]
-
-print("transform_bank_axis('L0.qk') =", qk_only.transform_bank_axis("L0.qk"))
-print("Before apply_transform('L0.qk', banked_qk):")
-print("query.bias[0, :8] =", qk_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[0, :8])
-print("query.weight[0, :2, :8] =")
-print(qk_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.weight")[0, :2, :8])
-print("\nbanked_qk[0, :4, :4] =")
-print(banked_qk[0, :4, :4])
-
-qk_only.apply_transform("L0.qk", banked_qk)
-
-print("\nAfter apply_transform('L0.qk', banked_qk):")
-print("query.bias[0, :8] =", qk_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[0, :8])
-print("query.weight[0, :2, :8] =")
-print(qk_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.weight")[0, :2, :8])
-
-
-# %% Head transport on real seed-0 tensors
-head_only = Symmeters.from_symmetry_dict(
-	{
-		"L0.qk": {
-			"bert.encoder.layer.0.attention.self.query.bias": seed0_symmeters.component(
-				"L0.qk",
-				"bert.encoder.layer.0.attention.self.query.bias",
-			),
-		},
-		"L0.ov": {
-			"bert.encoder.layer.0.attention.self.value.weight": seed0_symmeters.component(
-				"L0.ov",
-				"bert.encoder.layer.0.attention.self.value.weight",
-			),
-		},
-		"L0.head": {},
-	}
-)
-
-head_swap = torch.eye(seed0_symmeters.symmetry_size("L0.head"))
-head_swap[[0, 1]] = head_swap[[1, 0]]
-
-print("Before apply_head_transport(0, head_swap):")
-print("query.bias[:2, :8] =")
-print(head_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[:2, :8])
-print("\nvalue.weight[:2, :2, :8] =")
-print(head_only.tensor("L0.ov", "bert.encoder.layer.0.attention.self.value.weight")[:2, :2, :8])
-print("\nhead_swap[:4, :4] =")
-print(head_swap[:4, :4])
-
-head_only.apply_head_transport(0, head_swap)
-
-print("\nAfter apply_head_transport(0, head_swap):")
-print("query.bias[:2, :8] =")
-print(head_only.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[:2, :8])
-print("\nvalue.weight[:2, :2, :8] =")
-print(head_only.tensor("L0.ov", "bert.encoder.layer.0.attention.self.value.weight")[:2, :2, :8])
-
-
-# %% ordered_transform_names and apply_transforms on real seed-0 tensors
-ordered = Symmeters.from_symmetry_dict(
-	{
-		"model": {
-			"bert.encoder.layer.0.attention.output.dense.bias": seed0_symmeters.component(
-				"model",
-				"bert.encoder.layer.0.attention.output.dense.bias",
-			),
-		},
-		"L0.qk": {
-			"bert.encoder.layer.0.attention.self.query.bias": seed0_symmeters.component(
-				"L0.qk",
-				"bert.encoder.layer.0.attention.self.query.bias",
-			),
-		},
-		"L0.ov": {
-			"bert.encoder.layer.0.attention.self.value.weight": seed0_symmeters.component(
-				"L0.ov",
-				"bert.encoder.layer.0.attention.self.value.weight",
-			),
-		},
-		"L0.head": {},
-		"L0.mlp": {
-			"bert.encoder.layer.0.intermediate.dense.bias": seed0_symmeters.component(
-				"L0.mlp",
-				"bert.encoder.layer.0.intermediate.dense.bias",
-			),
-		},
-	}
-)
-
-mlp_swap = torch.eye(seed0_symmeters.symmetry_size("L0.mlp"))
-mlp_swap[[0, 1]] = mlp_swap[[1, 0]]
-transforms = {
-	"model": model_swap,
-	"L0.mlp": mlp_swap,
-	"head": head_swap,
-}
-
-print("ordered_transform_names() =", ordered.ordered_transform_names())
-print("\nBefore apply_transforms(transforms):")
-print("dense.bias[:8] =", ordered.tensor("model", "bert.encoder.layer.0.attention.output.dense.bias")[:8])
-print("query.bias[:2, :8] =")
-print(ordered.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[:2, :8])
-print("\nvalue.weight[:2, :2, :8] =")
-print(ordered.tensor("L0.ov", "bert.encoder.layer.0.attention.self.value.weight")[:2, :2, :8])
-print("\nmlp.bias[:8] =", ordered.tensor("L0.mlp", "bert.encoder.layer.0.intermediate.dense.bias")[:8])
-
-ordered.apply_transforms(transforms)
-
-print("\nAfter apply_transforms(transforms):")
-print("dense.bias[:8] =", ordered.tensor("model", "bert.encoder.layer.0.attention.output.dense.bias")[:8])
-print("query.bias[:2, :8] =")
-print(ordered.tensor("L0.qk", "bert.encoder.layer.0.attention.self.query.bias")[:2, :8])
-print("\nvalue.weight[:2, :2, :8] =")
-print(ordered.tensor("L0.ov", "bert.encoder.layer.0.attention.self.value.weight")[:2, :2, :8])
-print("\nmlp.bias[:8] =", ordered.tensor("L0.mlp", "bert.encoder.layer.0.intermediate.dense.bias")[:8])
-
-
-# %% clone, save, and load on a real seed-0 subset
-roundtrip = Symmeters.from_symmetry_dict(
-	{
-		"model": {
-			"bert.embeddings.position_embeddings.weight": seed0_symmeters.component(
-				"model",
-				"bert.embeddings.position_embeddings.weight",
-			),
-		},
-		"L0.mlp": {
-			"bert.encoder.layer.0.intermediate.dense.bias": seed0_symmeters.component(
-				"L0.mlp",
-				"bert.encoder.layer.0.intermediate.dense.bias",
-			),
-		},
-	}
-)
-
-roundtrip_clone = roundtrip.clone()
-with torch.no_grad():
-	roundtrip_clone["model"]["bert.embeddings.position_embeddings.weight"].tensor[0, 0] = -999.0
-
-print("Original position_embeddings[0, :8] =")
-print(roundtrip.tensor("model", "bert.embeddings.position_embeddings.weight")[0, :8])
-print("\nCloned position_embeddings[0, :8] after mutation =")
-print(roundtrip_clone.tensor("model", "bert.embeddings.position_embeddings.weight")[0, :8])
-
-with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
-	roundtrip.save(handle.name)
-	loaded = Symmeters.load(handle.name)
-	print("\nLoaded position_embeddings[0, :8] =")
-	print(loaded.tensor("model", "bert.embeddings.position_embeddings.weight")[0, :8])
-	print("\nLoaded mlp.bias[:8] =")
-	print(loaded.tensor("L0.mlp", "bert.encoder.layer.0.intermediate.dense.bias")[:8])
+# %%

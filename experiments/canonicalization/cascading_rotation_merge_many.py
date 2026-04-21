@@ -1,4 +1,5 @@
 # %%
+import gc
 import itertools
 from pathlib import Path
 
@@ -13,11 +14,13 @@ from lib.serial_model import serialize_model
 
 torch.manual_seed(0)
 device = torch.device("cuda")
+inference_device = torch.device("cpu")
 
 NUM_TRAIN = 20
 NUM_TEST = 5
 NUM_TOTAL = NUM_TRAIN + NUM_TEST
 OUTPUT_PATH = Path("data/alignment_models/cascading_rotation_merge_many.pt")
+CHECKPOINT_PATH = OUTPUT_PATH.with_suffix(".ckpt.pt")
 ROTATION_MSE_RTOL = 1e-4
 ROTATION_MSE_ATOL = 1e-8
 ROTATION_MSE_PATIENCE = 3
@@ -36,28 +39,29 @@ def pairwise_mse_values(evidence_list):
     ])
 
 
-def summarize_alignment(symmetry_name, raw_symmeters, aligned_symmeters):
-    raw_evidence = [symmetry_evidence(sym, symmetry_name) for sym in raw_symmeters]
+def summarize_alignment(symmetry_name, identity_baselines, aligned_symmeters):
     aligned_evidence = [symmetry_evidence(sym, symmetry_name) for sym in aligned_symmeters]
-
-    mse_identity = pairwise_mse_values(raw_evidence)
     mse_canonical = pairwise_mse_values(aligned_evidence)
-    identity_mean = mse_identity.mean()
+    identity_mean, identity_std = identity_baselines[symmetry_name]
     frac = 0.0 if identity_mean == 0.0 else (identity_mean - mse_canonical.mean()) / identity_mean * 100
 
     tqdm.write(f"\n--- Held-out {symmetry_name} ---")
-    tqdm.write(f"MSE (identity):            {identity_mean:.6f} ± {mse_identity.std():.6f}")
+    tqdm.write(f"MSE (identity):            {identity_mean:.6f} ± {identity_std:.6f}")
     tqdm.write(f"MSE (canonical cascade):   {mse_canonical.mean():.6f} ± {mse_canonical.std():.6f}")
     tqdm.write(f"Canonical closes {frac:.1f}% of identity MSE")
 
 
 def infer_transform(symmeters, symmetry_name, template):
     if symmetry_name.endswith(".head"):
-        template = {kind: tensor.to(device=device) for kind, tensor in template.items()}
-        return head_permutation_align(template, head_evidence(symmeters, symmetry_name))[0]
+        template = {kind: tensor.to(device=inference_device) for kind, tensor in template.items()}
+        evidence = {
+            kind: tensor.to(device=inference_device)
+            for kind, tensor in head_evidence(symmeters, symmetry_name).items()
+        }
+        return head_permutation_align(template, evidence)[0]
 
-    template = template.to(device=device)
-    evidence = Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().float().to(device)
+    template = template.to(device=inference_device)
+    evidence = Canonicalizer._evidence_tensor(symmeters, symmetry_name).detach().float().to(inference_device)
     return procrustes_align(template, evidence)
 
 
@@ -84,12 +88,6 @@ def fit_symmetry(
     previous_mse = None
     stagnant_steps = 0
 
-    if evidence.ndim == 3:
-        transforms = torch.eye(D, device=evidence.device).expand(N, D, D).clone()
-    else:
-        H = evidence.shape[1]
-        transforms = torch.eye(D, device=evidence.device).expand(N, H, D, D).clone()
-
     # Precompute upper-triangle mask for pairwise MSE
     tri_mask = torch.triu(torch.ones(N, N, device=evidence.device, dtype=torch.bool), diagonal=1)
 
@@ -97,17 +95,13 @@ def fit_symmetry(
     for _ in progress:
         mean = aligned.mean(dim=0)
 
-        # Batched Procrustes: all N models in one SVD call
-        new_transforms = procrustes_align(mean, evidence)
-
-        # Batched apply
-        if evidence.ndim == 3:
-            aligned = evidence @ new_transforms
-        else:
-            aligned = torch.einsum("nhkd,nhde->nhke", evidence, new_transforms)
-
-        max_delta = (new_transforms - transforms).flatten(1).norm(dim=1).max().item()
-        transforms = new_transforms
+        # Sequential Procrustes: one SVD at a time to avoid N×D×D peak memory
+        for i in range(N):
+            R = procrustes_align(mean, evidence[i])
+            if evidence.ndim == 3:
+                aligned[i] = evidence[i] @ R
+            else:
+                aligned[i] = torch.einsum("hkd,hde->hke", evidence[i], R)
 
         # Vectorized pairwise MSE
         flat = aligned.flatten(1)
@@ -117,7 +111,7 @@ def fit_symmetry(
         mse = mse_matrix[tri_mask].mean().item()
 
         mse_change = float("nan") if previous_mse is None else abs(mse - previous_mse)
-        progress.set_postfix(train_mse=f"{mse:.6f}", mse_change=f"{mse_change:.3e}", delta=f"{max_delta:.3e}")
+        progress.set_postfix(train_mse=f"{mse:.6f}", mse_change=f"{mse_change:.3e}")
 
         if stop_mode == "mse":
             if previous_mse is not None and np.isclose(mse, previous_mse, rtol=mse_rtol, atol=mse_atol):
@@ -129,11 +123,17 @@ def fit_symmetry(
                 break
             continue
 
-        if max_delta < tol:
+        if mse_change < tol:
             break
 
     progress.close()
-    return list(transforms), aligned.mean(dim=0)
+
+    # Compute final per-model transforms one at a time
+    template = aligned.mean(dim=0)
+    transforms = []
+    for i in range(N):
+        transforms.append(procrustes_align(template, evidence[i]))
+    return transforms, template
 
 
 def head_evidence(symmeters, symmetry_name):
@@ -205,9 +205,10 @@ def fit_head_symmetry(symmetry_name, evidence_list, n_iters=30, tol=1e-6):
 
 
 def procrustes_align(target, source):
-    # Supports arbitrary leading batch dims: (..., K, D)
     M = source.transpose(-1, -2) @ target
-    U, _, Vh = torch.linalg.svd(M)
+    U, S, Vh = torch.linalg.svd(M)
+    sign, _ = torch.linalg.slogdet(U @ Vh)
+    U[..., :, -1] *= sign.unsqueeze(-1)
     return U @ Vh
 
 
@@ -274,19 +275,63 @@ train_original = all_symmeters[:NUM_TRAIN]
 test_original = all_symmeters[NUM_TRAIN:]
 
 train_working = [sym.clone() for sym in train_original]
+test_working = [sym.clone() for sym in test_original]
+
+# Precompute identity MSE baselines so we can free originals
 base = train_working[0]
 order = default_cascade_order(base)
 
+identity_baselines = {}
+all_symmetry_names = set(order)
+for name in order:
+    if name.endswith(".head"):
+        prefix = name.rsplit(".", 1)[0]
+        all_symmetry_names.add(f"{prefix}.qk")
+        all_symmetry_names.add(f"{prefix}.ov")
+
+tqdm.write("Precomputing identity baselines...")
+for sym_name in tqdm(sorted(all_symmetry_names), desc="identity baselines"):
+    evidence = [symmetry_evidence(sym, sym_name) for sym in test_original]
+    mse_vals = pairwise_mse_values(evidence)
+    identity_baselines[sym_name] = (mse_vals.mean(), mse_vals.std())
+    del evidence
+
+# Free all originals — identity baselines are cached
+del all_symmeters, train_original, test_original
+gc.collect()
+
+# --- Resume from checkpoint if available ---
 templates = {}
-test_working = [sym.clone() for sym in test_original]
+completed = []
+
+if CHECKPOINT_PATH.exists():
+    ckpt = torch.load(CHECKPOINT_PATH, weights_only=True)
+    assert tuple(ckpt["order"]) == tuple(order), "Cascade order mismatch with checkpoint"
+    templates = ckpt["templates"]
+    completed = ckpt["completed"]
+    tqdm.write(f"Resuming from checkpoint: {len(completed)}/{len(order)} symmetries completed")
+    for sym_name in tqdm(completed, desc="replay checkpoint"):
+        for sym in train_working:
+            apply_symmetry_transform(sym, sym_name, infer_transform(sym, sym_name, templates[sym_name]))
+        for sym in test_working:
+            apply_symmetry_transform(sym, sym_name, infer_transform(sym, sym_name, templates[sym_name]))
+        gc.collect()
+    del ckpt
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+completed_set = set(completed)
 
 cascade_progress = tqdm(order, desc="cascade", total=len(order))
 for symmetry_name in cascade_progress:
     cascade_progress.set_postfix_str(f"current={symmetry_name}")
 
+    if symmetry_name in completed_set:
+        continue
+
     if symmetry_name == "L0.head":
         tqdm.write(f"\n[baseline] L0.qk before fitting:")
-        summarize_alignment("L0.qk", test_original, test_working)
+        summarize_alignment("L0.qk", identity_baselines, test_working)
 
     if symmetry_name.endswith(".head"):
         evidences = [head_evidence(sym, symmetry_name) for sym in train_working]
@@ -296,6 +341,7 @@ for symmetry_name in cascade_progress:
             apply_symmetry_transform(train_working[i], symmetry_name, P)
 
         templates[symmetry_name] = {kind: tensor.detach().cpu() for kind, tensor in template.items()}
+        del Ps
     else:
         evidences = [
             Canonicalizer._evidence_tensor(sym, symmetry_name).detach().float().to(device)
@@ -311,24 +357,31 @@ for symmetry_name in cascade_progress:
             apply_symmetry_transform(train_working[i], symmetry_name, T)
 
         templates[symmetry_name] = template.detach().cpu()
+        del Ts
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     for test_symmeters in tqdm(test_working, desc=f"apply {symmetry_name} to test", leave=False):
         matrix = infer_transform(test_symmeters, symmetry_name, templates[symmetry_name])
         apply_symmetry_transform(test_symmeters, symmetry_name, matrix)
 
-    summarize_alignment(symmetry_name, test_original, test_working)
+    summarize_alignment(symmetry_name, identity_baselines, test_working)
     if symmetry_name.endswith(".head"):
         prefix = symmetry_name.rsplit(".", 1)[0]
-        summarize_alignment(f"{prefix}.qk", test_original, test_working)
-        summarize_alignment(f"{prefix}.ov", test_original, test_working)
+        summarize_alignment(f"{prefix}.qk", identity_baselines, test_working)
+        summarize_alignment(f"{prefix}.ov", identity_baselines, test_working)
 
-    if symmetry_name.endswith(".head"):
-        del evidences, Ps
-    else:
-        del evidences, Ts
+    # Save checkpoint
+    completed.append(symmetry_name)
+    completed_set.add(symmetry_name)
+    torch.save({"order": tuple(order), "templates": templates, "completed": completed}, CHECKPOINT_PATH)
+
+    del evidences
     del template, matrix
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    gc.collect()
 
 cascade_progress.close()
 
@@ -337,11 +390,8 @@ fitted_canonicalizer = CascadingTemplateCanonicalizer(order, templates)
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 fitted_canonicalizer.save(str(OUTPUT_PATH))
 tqdm.write(f"Saved fitted canonicalizer to {OUTPUT_PATH}")
+CHECKPOINT_PATH.unlink(missing_ok=True)
 
-final_test_working = []
-for sym in test_original:
-    final_test_working.append(fitted_canonicalizer(sym))
-
-summarize_alignment("model", test_original, final_test_working)
+summarize_alignment("model", identity_baselines, test_working)
 
 # %%
